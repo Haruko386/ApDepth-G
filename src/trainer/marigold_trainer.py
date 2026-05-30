@@ -45,6 +45,7 @@ from src.util import metric
 from src.util.data_loader import skip_first_batches
 from src.util.logging_util import tb_logger, eval_dic_to_text
 from src.util.loss import get_loss
+from src.util.loss import LatentGradLoss
 from src.util.lr_scheduler import IterExponential
 from src.util.metric import MetricTracker
 from src.util.multi_res_noise import multi_res_noise_like
@@ -110,6 +111,7 @@ class MarigoldTrainer:
 
         # Loss
         self.loss = get_loss(loss_name=self.cfg.loss.name, **self.cfg.loss.kwargs)
+        self.latent_grad_loss = LatentGradLoss()
 
         # Training noise scheduler
         self.training_noise_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
@@ -270,6 +272,7 @@ class MarigoldTrainer:
                     )  # [B, 4, h, w]
                     # Encode DA2 depth
                     da2_depth_latent = self.model.encode_rgb(da2_depth)  # [B, 4, h, w]
+                
                 # Sample a random timestep for each image
                 timesteps = torch.randint(
                     0,
@@ -279,11 +282,9 @@ class MarigoldTrainer:
                     generator=rand_num_generator,
                 ).long()  # [B]
 
-                # Sample noise
                 if self.apply_multi_res_noise:
                     strength = self.mr_noise_strength
                     if self.annealed_mr_noise:
-                        # calculate strength depending on t
                         strength = strength * (timesteps / self.scheduler_timesteps)
                     noise = multi_res_noise_like(
                         gt_depth_latent,
@@ -298,6 +299,14 @@ class MarigoldTrainer:
                         device=device,
                         generator=rand_num_generator,
                     )  # [B, 4, h, w]
+                
+                offset_noise_strength = 0.1
+                offset_noise = torch.randn(
+                    batch_size, gt_depth_latent.shape[1], 1, 1, 
+                    device=device, 
+                    generator=rand_num_generator
+                ) * offset_noise_strength
+                noise = noise + offset_noise
 
                 # Add noise to the latents (diffusion forward process)
                 noisy_latents = self.training_noise_scheduler.add_noise(
@@ -319,6 +328,7 @@ class MarigoldTrainer:
                 model_pred = self.model.unet(
                     cat_latents, timesteps, text_embed
                 ).sample  # [B, 4, h, w]
+                
                 if torch.isnan(model_pred).any():
                     logging.warning("model_pred contains NaN.")
 
@@ -333,17 +343,43 @@ class MarigoldTrainer:
                     )  # [B, 4, h, w]
                 else:
                     raise ValueError(f"Unknown prediction type {self.prediction_type}")
+                
+                alphas_cumprod = self.training_noise_scheduler.alphas_cumprod.to(device)
+                alpha_prod_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+                beta_prod_t = 1 - alpha_prod_t
 
-                # Masked latent loss
+                if "v_prediction" == self.prediction_type:
+                    pred_x0 = (alpha_prod_t ** 0.5) * noisy_latents - (beta_prod_t ** 0.5) * model_pred
+                elif "epsilon" == self.prediction_type:
+                    pred_x0 = (noisy_latents - (beta_prod_t ** 0.5) * model_pred) / (alpha_prod_t ** 0.5)
+                else:
+                    pred_x0 = model_pred # sample type
+
+            
+                snr = alpha_prod_t / beta_prod_t
+                min_snr_gamma = 5.0
+                snr_weight = torch.clamp(snr, max=min_snr_gamma) / snr
+
+                diff = model_pred.float() - target.float()
+                if "l1" in self.cfg.loss.name.lower():
+                    unreduced_loss = torch.abs(diff)
+                else:
+                    unreduced_loss = torch.square(diff)
+                
+                unreduced_loss = unreduced_loss * snr_weight
+
                 if self.gt_mask_type is not None:
-                    latent_loss = self.loss(
-                        model_pred[valid_mask_down].float(),
-                        target[valid_mask_down].float(),
+                    latent_loss = unreduced_loss[valid_mask_down]
+                    grad_loss = self.latent_grad_loss(
+                        pred_x0.float(), 
+                        gt_depth_latent.float(), 
+                        valid_mask_down
                     )
                 else:
-                    latent_loss = self.loss(model_pred.float(), target.float())
+                    latent_loss = unreduced_loss
+                    grad_loss = self.latent_grad_loss(pred_x0.float(), gt_depth_latent.float())
 
-                loss = latent_loss.mean()
+                loss = latent_loss.mean() + 0.1 * grad_loss.mean()
 
                 self.train_metrics.update("loss", loss.item())
 
