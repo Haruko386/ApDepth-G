@@ -27,9 +27,9 @@ augmentation:
   lr_flip_p: 0.5
 
 dataloader:
-  num_workers: 2
-  effective_batch_size: 32
-  max_train_batch_size: 2
+  num_workers: 6
+  effective_batch_size: 36
+  max_train_batch_size: 6
   seed: 2024  # to ensure continuity when resuming from checkpoint
 
 # Training settings
@@ -50,6 +50,16 @@ multi_res_noise:
 
 gt_depth_type: depth_raw_norm
 gt_mask_type: valid_mask_raw
+
+# Validity-Guided Completion (VGC)
+# Training-only regularization for invalid / out-of-range regions, often sky in outdoor data.
+# It keeps the UNet input fixed to 12 channels and does not require sky masks.
+validity_guided_completion:
+  enabled: true
+  min_invalid_ratio: 0.08
+  anchor_weight: 0.02
+  smooth_weight: 0.005
+  eps: 1.0e-06
 
 # 建议这个数字不要再动
 max_epoch: 10000  # a large enough number to ensure convergence

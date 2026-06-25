@@ -145,9 +145,9 @@ class MarigoldPipeline(DiffusionPipeline):
         self.empty_text_embed = None
 
         da2_config = {
-            'encoder':'vitl',
-            'features': 256,
-            'out_channels': [256, 512, 1024, 1024]
+            'encoder':'vitg',
+            'features': 384,
+            'out_channels': [1536, 1536, 1536, 1536]
         }
 
         if da2_config is not None:
