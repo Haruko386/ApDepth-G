@@ -1,6 +1,6 @@
-# Last modified: 2025-01-14
+# Last modified: 2026-06-16
 #
-# Copyright 2025 Ziyang Song, USTC. All rights reserved.
+# Copyright 2026 Jiawei Wang, SJZU. All rights reserved.
 #
 # This file has been modified from the original version.
 # Original copyright (c) 2023 Bingxin Ke, ETH Zurich. All rights reserved.
