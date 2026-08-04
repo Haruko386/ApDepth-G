@@ -69,6 +69,7 @@ This setting corresponds to our paper. For academic comparison, please run with 
 python run.py \
     --checkpoint prs-eth/marigold-v1-0 \
     --ensemble_size 1 \
+    --config config/run.yaml \
     --input_rgb_dir input/in-the-wild_example \
     --output_dir output/in-the-wild_example
 ```
@@ -93,6 +94,60 @@ The default settings are optimized for the best result. However, the behavior of
 - `--batch_size`: Batch size of repeated inference. Default: 0 (best value determined automatically).
 - `--color_map`: [Colormap](https://matplotlib.org/stable/users/explain/colors/colormaps.html) used to colorize the depth prediction. Default: Spectral. Set to `None` to skip colored depth map generation.
 - `--apple_silicon`: Use Apple Silicon MPS acceleration.
+- `--config`: Runtime YAML configuration shared by `run.py` and `infer.py`. Default: `config/run.yaml`.
+
+### Prior-guided far-field rectification (PFR)
+
+Both inference entry points load PFR settings from `config/run.yaml`. PFR is a conservative post-processing guard for occasional far-field or sky depth reversals. It is disabled by default, so adding `--config config/run.yaml` does not change predictions until `enabled` is set to `true`.
+
+```yaml
+prior_guided_farfield_rectification:
+  enabled: true
+  top_ratio: 0.50
+  prior_far_quantile: 0.75
+  ref_near_quantile: 0.45
+  min_candidate_ratio: 0.015
+  margin: 0.02
+  strength: 0.15
+  smooth_kernel: 21
+  prior_far_is_larger: true
+  depth_far_is_larger: true
+  eps: 1.0e-06
+```
+
+The fields have the following meanings:
+
+- `enabled`: Enables or disables PFR.
+- `top_ratio`: Fraction of the upper image searched for far-field candidates.
+- `prior_far_quantile`: Prior-depth quantile used to select confident far-field pixels in the upper region.
+- `ref_near_quantile`: Prior-depth quantile used to select near-reference pixels in the lower region.
+- `min_candidate_ratio`: Minimum candidate/reference area relative to the full image.
+- `margin`: Minimum separation enforced between far candidates and near-reference depth.
+- `strength`: Blend strength of the rectification; `0` leaves the prediction unchanged.
+- `smooth_kernel`: Smoothing-kernel size for the candidate mask; even values are promoted to the next odd value.
+- `prior_far_is_larger`: Set according to whether larger prior values mean farther depth.
+- `depth_far_is_larger`: Set according to whether larger output values mean farther depth.
+- `eps`: Numerical stability constant used during prior normalization.
+
+To use another runtime file, pass it explicitly:
+
+```bash
+python run.py \
+    --config path/to/run.yaml \
+    --checkpoint prs-eth/marigold-v1-0 \
+    --input_rgb_dir input/in-the-wild_example \
+    --output_dir output/in-the-wild_example
+```
+
+Dataset inference uses the same runtime configuration independently of its dataset configuration:
+
+```bash
+python infer.py \
+    --config config/run.yaml \
+    --dataset_config config/dataset/data_nyu_test.yaml \
+    --base_data_dir /path/to/datasets \
+    --output_dir output/nyu
+```
 
 ### ⬇ Checkpoint cache
 
