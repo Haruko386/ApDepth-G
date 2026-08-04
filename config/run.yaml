@@ -1,0 +1,12 @@
+prior_guided_farfield_rectification:
+  enabled: false
+  top_ratio: 0.50
+  prior_far_quantile: 0.75
+  ref_near_quantile: 0.45
+  min_candidate_ratio: 0.015
+  margin: 0.02
+  strength: 0.15
+  smooth_kernel: 21
+  prior_far_is_larger: true
+  depth_far_is_larger: true
+  eps: 1.0e-06

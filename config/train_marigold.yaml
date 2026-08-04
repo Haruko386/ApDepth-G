@@ -5,7 +5,6 @@ base_config:
 # - config/dataset/data_vkitti_val.yaml
 - config/dataset/dataset_train.yaml
 - config/dataset/dataset_val.yaml
-# 下面这个可视化可以不要
 # - config/dataset/dataset_vis.yaml
 - config/model_sdv2.yaml
 
@@ -61,7 +60,6 @@ validity_guided_completion:
   smooth_weight: 0.005
   eps: 1.0e-06
 
-# 建议这个数字不要再动
 max_epoch: 10000  # a large enough number to ensure convergence
 max_iter: 23000 # usually converges at around 20k
 
