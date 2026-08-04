@@ -1,8 +1,54 @@
-# Author: Bingxin Ke
-# Last modified: 2024-02-14
+# Author: Jiawei Wang
+# Last modified: 2026-08-04
+
+import os
+from typing import Any, Dict, Tuple
 
 import omegaconf
 from omegaconf import OmegaConf
+
+
+PFR_CONFIG_KEY = "prior_guided_farfield_rectification"
+PFR_OPTION_NAMES = {
+    "top_ratio",
+    "prior_far_quantile",
+    "ref_near_quantile",
+    "min_candidate_ratio",
+    "margin",
+    "strength",
+    "smooth_kernel",
+    "prior_far_is_larger",
+    "depth_far_is_larger",
+    "eps",
+}
+
+
+def load_pfr_config(config_path: str) -> Tuple[bool, Dict[str, Any]]:
+    """Load and validate the inference-time PFR configuration."""
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"Runtime config not found: {config_path}")
+
+    config = OmegaConf.load(config_path)
+    if not isinstance(config, omegaconf.DictConfig):
+        raise TypeError(f"Runtime config must be a YAML mapping: {config_path}")
+
+    section = config.get(PFR_CONFIG_KEY)
+    if section is None:
+        return False, {}
+    if not isinstance(section, omegaconf.DictConfig):
+        raise TypeError(f"'{PFR_CONFIG_KEY}' must be a YAML mapping")
+
+    pfr_config = OmegaConf.to_container(section, resolve=True)
+    enabled = pfr_config.pop("enabled", False)
+    if not isinstance(enabled, bool):
+        raise TypeError(f"'{PFR_CONFIG_KEY}.enabled' must be true or false")
+
+    unknown_options = set(pfr_config) - PFR_OPTION_NAMES
+    if unknown_options:
+        unknown = ", ".join(sorted(unknown_options))
+        raise ValueError(f"Unknown options in '{PFR_CONFIG_KEY}': {unknown}")
+
+    return enabled, pfr_config
 
 
 def recursive_load_config(config_path: str) -> OmegaConf:

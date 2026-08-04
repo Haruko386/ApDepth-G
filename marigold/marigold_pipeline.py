@@ -24,6 +24,7 @@ from typing import Dict, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from diffusers import (
     AutoencoderKL,
     DDIMScheduler,
@@ -144,6 +145,12 @@ class MarigoldPipeline(DiffusionPipeline):
 
         self.empty_text_embed = None
 
+        # Optional inference-time Prior-guided Far-field Rectification (PFR).
+        # These attributes let external scripts or trainer validation enable PFR
+        # without changing model weights or the 12-channel denoising path.
+        self.pfr_enabled = False
+        self.pfr_kwargs = {}
+
         da2_config = {
             'encoder':'vitg',
             'features': 384,
@@ -171,6 +178,8 @@ class MarigoldPipeline(DiffusionPipeline):
         color_map: str = "Spectral",
         show_progress_bar: bool = True,
         ensemble_kwargs: Dict = None,
+        pfr_enabled: Optional[bool] = None,
+        pfr_kwargs: Dict = None,
     ) -> MarigoldDepthOutput:
         """
         Function invoked when calling the pipeline.
@@ -208,6 +217,12 @@ class MarigoldPipeline(DiffusionPipeline):
                 Flag of shift-invariant prediction, if True, shift will be adjusted from the raw prediction, if False, near plane will be fixed at 0m.
             ensemble_kwargs (`dict`, *optional*, defaults to `None`):
                 Arguments for detailed ensembling settings.
+            pfr_enabled (`bool`, *optional*, defaults to `None`):
+                Enable prior-guided far-field rectification. `None` uses the
+                value stored on the pipeline, which defaults to `False`.
+            pfr_kwargs (`dict`, *optional*, defaults to `None`):
+                Keyword arguments forwarded to prior-guided far-field
+                rectification. `None` uses the settings stored on the pipeline.
         Returns:
             `MarigoldDepthOutput`: Output class for Marigold monocular depth prediction pipeline, including:
             - **depth_np** (`np.ndarray`) Predicted depth map, with depth values in the range of [0, 1]
@@ -215,6 +230,11 @@ class MarigoldPipeline(DiffusionPipeline):
             - **uncertainty** (`None` or `np.ndarray`) Uncalibrated uncertainty(MAD, median absolute deviation)
                     coming from ensembling. None if `ensemble_size = 1`
         """
+        if pfr_enabled is None:
+            pfr_enabled = getattr(self, "pfr_enabled", False)
+        if pfr_kwargs is None:
+            pfr_kwargs = getattr(self, "pfr_kwargs", {})
+
         # Model-specific optimal default values leading to fast and reasonable results.
         if denoising_steps is None:
             denoising_steps = self.default_denoising_steps
@@ -290,6 +310,8 @@ class MarigoldPipeline(DiffusionPipeline):
                 num_inference_steps=denoising_steps,
                 show_pbar=show_progress_bar,
                 generator=generator,
+                pfr_enabled=pfr_enabled,
+                pfr_kwargs=pfr_kwargs,
             )
             depth_pred_ls.append(depth_pred_raw.detach())
         depth_preds = torch.concat(depth_pred_ls, dim=0)
@@ -386,6 +408,8 @@ class MarigoldPipeline(DiffusionPipeline):
         num_inference_steps: int,
         generator: Union[torch.Generator, None],
         show_pbar: bool,
+        pfr_enabled: Optional[bool] = None,
+        pfr_kwargs: Dict = None,
     ) -> torch.Tensor:
         """
         Perform an individual depth prediction without ensembling.
@@ -399,9 +423,19 @@ class MarigoldPipeline(DiffusionPipeline):
                 Display a progress bar of diffusion denoising.
             generator (`torch.Generator`)
                 Random generator for initial noise generation.
+            pfr_enabled (`bool`, *optional*, defaults to `None`):
+                Enable prior-guided far-field rectification.
+            pfr_kwargs (`dict`, *optional*, defaults to `None`):
+                Keyword arguments forwarded to prior-guided far-field
+                rectification.
         Returns:
             `torch.Tensor`: Predicted depth map.
         """
+        if pfr_enabled is None:
+            pfr_enabled = getattr(self, "pfr_enabled", False)
+        if pfr_kwargs is None:
+            pfr_kwargs = getattr(self, "pfr_kwargs", {})
+
         device = self.device
         rgb_in = rgb_in.to(device)
         da2_depth = self.da2.infer_batch(rgb_in).to(device)
@@ -462,7 +496,136 @@ class MarigoldPipeline(DiffusionPipeline):
         # shift to [0, 1]
         depth = (depth + 1.0) / 2.0
 
+        if pfr_enabled:
+            depth = self._prior_guided_farfield_rectification(
+                depth=depth,
+                prior_depth=da2_depth,
+                **(pfr_kwargs or {}),
+            )
+
         return depth
+
+    @torch.no_grad()
+    def _prior_guided_farfield_rectification(
+        self,
+        depth: torch.Tensor,
+        prior_depth: torch.Tensor,
+        top_ratio: float = 0.55,
+        prior_far_quantile: float = 0.70,
+        ref_near_quantile: float = 0.45,
+        min_candidate_ratio: float = 0.015,
+        margin: float = 0.03,
+        strength: float = 0.25,
+        smooth_kernel: int = 21,
+        prior_far_is_larger: bool = True,
+        depth_far_is_larger: bool = True,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """Rectify rare sky-near failures using prior-depth ordering.
+
+        The denoising model already uses DA2 as a 12-channel latent condition.
+        PFR does not add any channel and does not require a sky mask. Instead,
+        after decoding, it checks the upper image region where the DA2 prior is
+        confidently far. If the prediction makes that region closer than lower
+        near-reference regions, PFR softly moves only the selected upper-far
+        region back to the far side.
+
+        This is intentionally conservative: it is a post-decoding safety guard
+        for occasional sky-depth reversals rather than a replacement for the
+        learned depth prediction.
+        """
+        if depth is None or prior_depth is None or strength <= 0:
+            return depth
+
+        if prior_depth.shape[-2:] != depth.shape[-2:]:
+            prior_depth = F.interpolate(
+                prior_depth.float(),
+                size=depth.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        prior_depth = prior_depth.to(device=depth.device, dtype=depth.dtype)
+
+        # Use a single-channel prior if the upstream model returns repeated maps.
+        if prior_depth.shape[1] != 1:
+            prior_depth = prior_depth.mean(dim=1, keepdim=True)
+
+        bsz, _, h, w = depth.shape
+        out = depth.clone()
+        top_h = max(1, min(h, int(round(h * float(top_ratio)))))
+        min_pixels = max(1, int(round(h * w * float(min_candidate_ratio))))
+
+        top_mask = torch.zeros((h, w), device=depth.device, dtype=torch.bool)
+        top_mask[:top_h, :] = True
+        lower_mask = ~top_mask
+
+        if smooth_kernel is None:
+            smooth_kernel = 1
+        smooth_kernel = int(smooth_kernel)
+        if smooth_kernel < 1:
+            smooth_kernel = 1
+        if smooth_kernel % 2 == 0:
+            smooth_kernel += 1
+
+        for bi in range(bsz):
+            prior = prior_depth[bi, 0]
+            pred = depth[bi, 0]
+
+            # Robustly normalize the prior. After this step, larger means farther.
+            prior_flat = prior.flatten()
+            p_low = torch.quantile(prior_flat, 0.02)
+            p_high = torch.quantile(prior_flat, 0.98)
+            prior_norm = (prior - p_low) / (p_high - p_low).clamp_min(eps)
+            prior_norm = prior_norm.clamp(0.0, 1.0)
+            if not prior_far_is_larger:
+                prior_norm = 1.0 - prior_norm
+
+            top_values = prior_norm[top_mask]
+            if top_values.numel() == 0:
+                continue
+            far_thr = torch.quantile(top_values, float(prior_far_quantile))
+            candidate = top_mask & (prior_norm >= far_thr)
+            if int(candidate.sum().item()) < min_pixels:
+                continue
+
+            ref_values = prior_norm[lower_mask]
+            if ref_values.numel() == 0:
+                continue
+            near_thr = torch.quantile(prior_norm.flatten(), float(ref_near_quantile))
+            reference = lower_mask & (prior_norm <= near_thr)
+            if int(reference.sum().item()) < min_pixels:
+                # Fallback: use the lower image region when there are too few
+                # near-prior reference pixels.
+                reference = lower_mask
+            if int(reference.sum().item()) < min_pixels:
+                continue
+
+            cand_depth = torch.median(pred[candidate])
+            ref_depth = torch.median(pred[reference])
+
+            if depth_far_is_larger:
+                violation = cand_depth < (ref_depth + margin)
+                if not bool(violation.item()):
+                    continue
+                target = torch.maximum(pred, torch.full_like(pred, ref_depth + margin))
+            else:
+                violation = cand_depth > (ref_depth - margin)
+                if not bool(violation.item()):
+                    continue
+                target = torch.minimum(pred, torch.full_like(pred, ref_depth - margin))
+
+            candidate_f = candidate.to(dtype=depth.dtype).view(1, 1, h, w)
+            if smooth_kernel > 1:
+                candidate_f = F.avg_pool2d(
+                    candidate_f,
+                    kernel_size=smooth_kernel,
+                    stride=1,
+                    padding=smooth_kernel // 2,
+                ).clamp(0.0, 1.0)
+            blend = (float(strength) * candidate_f[0, 0]).clamp(0.0, 1.0)
+            out[bi, 0] = pred * (1.0 - blend) + target * blend
+
+        return out.clamp(0.0, 1.0)
 
     def encode_rgb(self, rgb_in: torch.Tensor) -> torch.Tensor:
         """
