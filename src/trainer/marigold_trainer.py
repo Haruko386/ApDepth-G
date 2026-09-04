@@ -1,11 +1,9 @@
-# An official reimplemented version of Marigold training script.
-# Last modified: 2024-08-16
+# Last modified: 2026-06-16
 #
-# Copyright 2023 Bingxin Ke, ETH Zurich. All rights reserved.
+# Copyright 2026 Jiawei Wang, SJZU. All rights reserved.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# This file has been modified from the original version.
+# Original copyright (c) 2023 Bingxin Ke, ETH Zurich. All rights reserved.
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -82,8 +80,9 @@ class MarigoldTrainer:
         self.vis_loaders: List[DataLoader] = vis_dataloaders
         self.accumulation_steps: int = accumulation_steps
 
-        # Adapt input layers
-        if 8 != self.model.unet.config["in_channels"]:
+        # Adapt input layers. The method uses fixed 12-channel conditioning:
+        # RGB latent (4) + DA2 prior latent (4) + noisy depth latent (4).
+        if 12 != self.model.unet.config["in_channels"]:
             self._replace_unet_conv_in()
 
         # Encode empty text prompt
@@ -112,6 +111,17 @@ class MarigoldTrainer:
         # Loss
         self.loss = get_loss(loss_name=self.cfg.loss.name, **self.cfg.loss.kwargs)
         self.latent_grad_loss = LatentGradLoss()
+
+        # Validity-Guided Completion (VGC)
+        # This is a mask-free sky-collapse regularizer: it does not use sky masks
+        # or extra input channels. It only acts on regions without valid depth
+        # supervision, which are common in outdoor sky / out-of-range areas.
+        vgc_cfg = self.cfg.get("validity_guided_completion", {})
+        self.vgc_enabled = bool(vgc_cfg.get("enabled", False))
+        self.vgc_min_invalid_ratio = float(vgc_cfg.get("min_invalid_ratio", 0.08))
+        self.vgc_anchor_weight = float(vgc_cfg.get("anchor_weight", 0.02))
+        self.vgc_smooth_weight = float(vgc_cfg.get("smooth_weight", 0.005))
+        self.vgc_eps = float(vgc_cfg.get("eps", 1e-6))
 
         # Training noise scheduler
         self.training_noise_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
@@ -258,6 +268,7 @@ class MarigoldTrainer:
                         invalid_mask.float(), 8, 8
                     ).bool()
                     valid_mask_down = valid_mask_down.repeat((1, 4, 1, 1))
+                    invalid_mask_down = ~valid_mask_down
                 else:
                     raise NotImplementedError
 
@@ -381,6 +392,17 @@ class MarigoldTrainer:
 
                 loss = latent_loss.mean() + 0.1 * grad_loss.mean()
 
+                if self.vgc_enabled:
+                    # VGC only supervises invalid-depth regions. This prevents the
+                    # regularizer from changing NYU-style valid indoor regions, while
+                    # still giving sky / out-of-range regions a weak geometric target.
+                    vgc_loss = self._validity_guided_completion_loss(
+                        pred_x0=pred_x0.float(),
+                        prior_latent=da2_depth_latent.float().detach(),
+                        invalid_mask=invalid_mask_down,
+                    )
+                    loss = loss + vgc_loss
+
                 self.train_metrics.update("loss", loss.item())
 
                 loss = loss / self.gradient_accumulation_steps
@@ -445,6 +467,58 @@ class MarigoldTrainer:
 
             # Epoch end
             self.n_batch_in_epoch = 0
+
+    def _validity_guided_completion_loss(self, pred_x0, prior_latent, invalid_mask):
+        """Weakly complete invalid-depth regions using the detached DA2 prior.
+
+        Outdoor sky and out-of-range regions are often excluded by the valid-depth
+        mask, so the normal supervised loss gives them no training signal. VGC
+        adds a small training-only loss on those invalid regions, without using a
+        sky segmentation mask and without changing the 12-channel input.
+        """
+        if invalid_mask is None:
+            return pred_x0.new_tensor(0.0)
+
+        invalid_mask = invalid_mask.to(device=pred_x0.device, dtype=pred_x0.dtype)
+        if invalid_mask.shape != pred_x0.shape:
+            invalid_mask = invalid_mask.expand_as(pred_x0)
+
+        # Avoid applying the loss to tiny missing-depth holes. This is important
+        # for indoor datasets such as NYU, where most pixels are valid and small
+        # invalid holes should not dominate training.
+        invalid_ratio = invalid_mask.flatten(1).mean(dim=1)  # [B]
+        sample_gate = (invalid_ratio >= self.vgc_min_invalid_ratio).to(pred_x0.dtype)
+        if sample_gate.sum() <= 0:
+            return pred_x0.new_tensor(0.0)
+
+        sample_gate = sample_gate.view(-1, 1, 1, 1)
+        mask = invalid_mask * sample_gate
+        denom = mask.sum().clamp_min(self.vgc_eps)
+
+        # Region-level anchor: align only the mean latent response in invalid
+        # regions to the prior. This prevents copying high-frequency DA2 artifacts
+        # into sky while still preventing free collapse.
+        pred_region_mean = (pred_x0 * mask).sum(dim=(2, 3), keepdim=True) / (
+            mask.sum(dim=(2, 3), keepdim=True).clamp_min(self.vgc_eps)
+        )
+        prior_region_mean = (prior_latent * mask).sum(dim=(2, 3), keepdim=True) / (
+            mask.sum(dim=(2, 3), keepdim=True).clamp_min(self.vgc_eps)
+        )
+        anchor_loss = ((pred_region_mean - prior_region_mean) ** 2 * sample_gate).sum() / (
+            sample_gate.sum().clamp_min(self.vgc_eps) * pred_x0.shape[1]
+        )
+
+        # Smooth invalid regions only. This suppresses sky-like texture collapse but
+        # does not smooth valid object boundaries.
+        grad_x = torch.abs(pred_x0[..., 1:] - pred_x0[..., :-1])
+        grad_y = torch.abs(pred_x0[:, :, 1:, :] - pred_x0[:, :, :-1, :])
+        mask_x = mask[..., 1:] * mask[..., :-1]
+        mask_y = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+        smooth_x = (grad_x * mask_x).sum() / mask_x.sum().clamp_min(self.vgc_eps)
+        smooth_y = (grad_y * mask_y).sum() / mask_y.sum().clamp_min(self.vgc_eps)
+        smooth_loss = 0.5 * (smooth_x + smooth_y)
+
+        return self.vgc_anchor_weight * anchor_loss + self.vgc_smooth_weight * smooth_loss
 
     def encode_depth(self, depth_in):
         # stack depth into 3-channel
