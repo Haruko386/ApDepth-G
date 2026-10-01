@@ -5,6 +5,22 @@ import json
 from pathlib import Path
 
 
+def validate_output_directory(destination):
+    """Allow retry of an empty directory left by an earlier loading failure."""
+    if not destination.exists():
+        return
+    if not destination.is_dir():
+        raise FileExistsError(f"Output is not a directory: {destination}")
+    entries = list(destination.iterdir())
+    if not entries:
+        return
+    if (len(entries) == 1 and entries[0].name == "masks"
+            and entries[0].is_dir() and not entries[0].is_symlink()
+            and not any(entries[0].iterdir())):
+        return
+    raise FileExistsError(f"Output contains existing results: {destination}. Use a new output directory.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train_rgb_dir", required=True)
@@ -28,13 +44,21 @@ def main():
         if not files[split]:
             raise ValueError(f"No RGB images for {split}")
     destination = Path(args.output_dir).resolve()
-    destination.mkdir(parents=True, exist_ok=False)
-    (destination / "masks").mkdir()
-    processor = AutoImageProcessor.from_pretrained(args.model)
-    model = AutoModelForSemanticSegmentation.from_pretrained(args.model).to(args.device).eval()
+    validate_output_directory(destination)
+    processor = AutoImageProcessor.from_pretrained(args.model, use_fast=False)
+    # Never fall back to pickle .bin weights. Recent Transformers correctly
+    # refuse those on torch < 2.6; safetensors works with the project's torch 2.4.
+    # For Hub repos with only .bin on main, Transformers can resolve the
+    # safetensors conversion revision (the user's log already downloaded it).
+    model = AutoModelForSemanticSegmentation.from_pretrained(
+        args.model, use_safetensors=True
+    ).to(args.device).eval()
     sky_ids = [int(i) for i, name in model.config.id2label.items() if name.strip().lower() == "sky"]
     if len(sky_ids) != 1:
         raise ValueError("Model must have one class explicitly named 'sky'")
+    # Do not leave new output directories behind if model loading fails.
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "masks").mkdir(exist_ok=True)
     seen, rows = set(), []
     with torch.no_grad():
         for split, images in files.items():
