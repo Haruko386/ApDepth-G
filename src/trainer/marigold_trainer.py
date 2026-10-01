@@ -49,6 +49,9 @@ from src.util.metric import MetricTracker
 from src.util.multi_res_noise import multi_res_noise_like
 from src.util.alignment import align_depth_least_square
 from src.util.seeding import generate_seed_sequence
+from src.util.residual_completion import (
+    latent_validity_masks, min_snr_weights, residual_completion_loss,
+)
 
 
 class MarigoldTrainer:
@@ -95,6 +98,8 @@ class MarigoldTrainer:
         self.model.vae.requires_grad_(False)
         self.model.text_encoder.requires_grad_(False)
         self.model.unet.requires_grad_(True)
+        self.model.da2.requires_grad_(False)
+        self.model.da2.eval()
 
         # Optimizer !should be defined after input layer is adapted
         lr = self.cfg.lr
@@ -122,6 +127,13 @@ class MarigoldTrainer:
         self.vgc_anchor_weight = float(vgc_cfg.get("anchor_weight", 0.02))
         self.vgc_smooth_weight = float(vgc_cfg.get("smooth_weight", 0.005))
         self.vgc_eps = float(vgc_cfg.get("eps", 1e-6))
+        self.vgc_mode = vgc_cfg.get("mode", "legacy")
+        if self.vgc_mode not in ("legacy", "residual_snr"):
+            raise ValueError(f"Unknown completion mode: {self.vgc_mode}")
+        self.vgc_gradient_weight = float(vgc_cfg.get("gradient_weight", 0.005))
+        self.min_snr_gamma = float(self.cfg.get("min_snr_gamma", 5.0))
+        if self.min_snr_gamma <= 0:
+            raise ValueError("min_snr_gamma must be positive")
 
         # Training noise scheduler
         self.training_noise_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
@@ -141,7 +153,11 @@ class MarigoldTrainer:
 
         # Eval metrics
         self.metric_funcs = [getattr(metric, _met) for _met in cfg.eval.eval_metrics]
-        self.train_metrics = MetricTracker(*["loss"])
+        self.train_metrics = MetricTracker(
+            "loss", "diffusion_loss", "latent_gradient_loss", "completion_loss",
+            "completion_anchor", "completion_gradient", "completion_coverage",
+            "completion_snr_weight",
+        )
         self.val_metrics = MetricTracker(*[m.__name__ for m in self.metric_funcs])
         # main metric for best checkpoint saving
         self.main_val_metric = cfg.validation.main_val_metric
@@ -238,14 +254,14 @@ class MarigoldTrainer:
                 # Get data
                 rgb = batch["rgb_norm"].to(device)
                 depth_gt_for_latent = batch[self.gt_depth_type].to(device)
-                da2_depth = self.model.da2.infer_batch(rgb).to(device)
+                with torch.no_grad():
+                    da2_depth = self.model.da2.infer_batch(rgb).to(device)
 
                 if self.gt_mask_type is not None:
                     valid_mask_for_latent = batch[self.gt_mask_type].to(device)
-                    invalid_mask = ~valid_mask_for_latent
-                    valid_mask_down = ~torch.max_pool2d(
-                        invalid_mask.float(), 8, 8
-                    ).bool()
+                    valid_mask_down, invalid_interior_down = latent_validity_masks(
+                        valid_mask_for_latent
+                    )
                     valid_mask_down = valid_mask_down.repeat((1, 4, 1, 1))
                     invalid_mask_down = ~valid_mask_down
                 else:
@@ -346,9 +362,9 @@ class MarigoldTrainer:
                     pred_x0 = model_pred # sample type
 
             
-                snr = alpha_prod_t / beta_prod_t
-                min_snr_gamma = 5.0
-                snr_weight = torch.clamp(snr, max=min_snr_gamma) / snr
+                snr_weight, completion_snr_weight = min_snr_weights(
+                    alpha_prod_t, self.prediction_type, self.min_snr_gamma
+                )
 
                 diff = model_pred.float() - target.float()
                 if "l1" in self.cfg.loss.name.lower():
@@ -359,7 +375,7 @@ class MarigoldTrainer:
                 unreduced_loss = unreduced_loss * snr_weight
 
                 if self.gt_mask_type is not None:
-                    latent_loss = unreduced_loss[valid_mask_down]
+                    latent_loss = torch.where(valid_mask_down, unreduced_loss, 0.0).sum() / valid_mask_down.sum().clamp_min(1)
                     grad_loss = self.latent_grad_loss(
                         pred_x0.float(), 
                         gt_depth_latent.float(), 
@@ -370,11 +386,22 @@ class MarigoldTrainer:
                     grad_loss = self.latent_grad_loss(pred_x0.float(), gt_depth_latent.float())
 
                 loss = latent_loss.mean() + 0.1 * grad_loss.mean()
+                vgc_loss = loss.new_zeros(())
+                completion_stats = {}
 
-                if self.vgc_enabled:
+                if self.vgc_enabled and self.vgc_mode == "residual_snr":
+                    vgc_loss, completion_stats = residual_completion_loss(
+                        pred_x0, da2_depth_latent, invalid_interior_down,
+                        completion_snr_weight,
+                        anchor_weight=self.vgc_anchor_weight,
+                        gradient_weight=self.vgc_gradient_weight,
+                        min_invalid_ratio=self.vgc_min_invalid_ratio,
+                    )
+                    loss = loss + vgc_loss
+                elif self.vgc_enabled:
                     # VGC only supervises invalid-depth regions. This prevents the
-                    # regularizer from changing NYU-style valid indoor regions, while
-                    # still giving sky / out-of-range regions a weak geometric target.
+                    # regularizer from directly supervising valid pixels. Shared
+                    # U-Net parameters still require indoor regression evaluation.
                     vgc_loss = self._validity_guided_completion_loss(
                         pred_x0=pred_x0.float(),
                         prior_latent=da2_depth_latent.float().detach(),
@@ -383,6 +410,11 @@ class MarigoldTrainer:
                     loss = loss + vgc_loss
 
                 self.train_metrics.update("loss", loss.item())
+                self.train_metrics.update("diffusion_loss", latent_loss.mean().item())
+                self.train_metrics.update("latent_gradient_loss", grad_loss.mean().item())
+                self.train_metrics.update("completion_loss", vgc_loss.item())
+                for name, value in completion_stats.items():
+                    self.train_metrics.update(name, value.item())
 
                 loss = loss / self.gradient_accumulation_steps
                 loss.backward()
