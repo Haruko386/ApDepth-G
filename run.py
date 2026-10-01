@@ -256,6 +256,7 @@ if "__main__" == __name__:
                 color_map=color_map,
                 show_progress_bar=True,
                 resample_method=resample_method,
+                generator=torch.Generator(device=device).manual_seed(seed) if seed is not None else None,
             )
 
             depth_pred: np.ndarray = pipe_out.depth_np
