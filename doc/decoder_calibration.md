@@ -99,6 +99,18 @@ decoder 可能无法在修复天空的同时保留物体。阴天、雾、白墙
 
 1. 可选：生成候选天空标注。
 
+如果沿用项目配置中的已解压 VKITTI/Hypersim，先从文件清单自动提取 RGB 子集：
+
+```bash
+python -m script.prepare_decoder_rgb --base_data_dir /root/Dataset --output_dir ./output/decoder_rgb
+```
+
+默认训练集为 160 张 VKITTI + 40 张 Hypersim，验证集为 40 + 10 张，数量只是小实验起点。
+VKITTI 沿用仓库 train/val 场景划分；Hypersim 按场景留出约 20% 作为此次后训练验证候选。
+这是后训练层面的留出，不表示这些图像从未参与过原 VGC 的训练。脚本只读取清单第一列 RGB，
+不会把深度 PNG 当 RGB。数据路径来自 `config/dataset/dataset_train.yaml`，文件缺失会明确报错。
+可据此将下一条命令中的目录分别替换为 `./output/decoder_rgb/train` 和 `./output/decoder_rgb/val`。
+
 ```bash
 python -m script.prepare_sky_masks --train_rgb_dir /path/to/train_rgb --val_rgb_dir /path/to/val_rgb --output_dir ./output/sky_labels
 ```
