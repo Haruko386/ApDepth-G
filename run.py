@@ -35,7 +35,7 @@ from marigold import MarigoldPipeline
 EXTENSION_LIST = [".jpg", ".jpeg", ".png"]
 
 from torchvision import transforms
-from marigold.modules.unet_2d_condition import UNet2DConditionModel
+from src.util.model_overrides import apply_model_overrides
 
 
 if "__main__" == __name__:
@@ -58,6 +58,9 @@ if "__main__" == __name__:
         required=True,
         help="Path to the input image folder.",
     )
+    parser.add_argument("--backbone", choices=["sd2", "sdxl"], default="sd2")
+    parser.add_argument("--unet_checkpoint", help="Matching backbone checkpoint containing unet/")
+    parser.add_argument("--decoder_checkpoint", help="Calibration best/ or step_XXXXXX/ directory containing vae/")
 
     parser.add_argument(
         "--output_dir", type=str, required=True, help="Output directory."
@@ -207,9 +210,11 @@ if "__main__" == __name__:
         dtype = torch.float32
         variant = None
 
-    pipe: MarigoldPipeline = MarigoldPipeline.from_pretrained(
-        checkpoint_path, variant=variant, torch_dtype=dtype
+    from src.util.pipeline_loader import load_depth_pipeline
+    pipe = load_depth_pipeline(
+        checkpoint_path, backbone=args.backbone, variant=variant, torch_dtype=dtype
     )
+    apply_model_overrides(pipe, args.unet_checkpoint, args.decoder_checkpoint)
     # unet = UNet2DConditionModel.from_pretrained(os.path.join(checkpoint_path, f'unet'))
     # pipe.unet = unet
 
@@ -253,6 +258,7 @@ if "__main__" == __name__:
                 color_map=color_map,
                 show_progress_bar=True,
                 resample_method=resample_method,
+                generator=torch.Generator(device=device).manual_seed(seed) if seed is not None else None,
             )
 
             depth_pred: np.ndarray = pipe_out.depth_np

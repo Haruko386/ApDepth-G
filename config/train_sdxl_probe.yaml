@@ -1,0 +1,17 @@
+base_config:
+- config/train_sdxl_demo.yaml
+
+# Two full optimizer updates, each containing one HyperSim and one VKITTI
+# microbatch. No weight checkpoints; this is a memory/implementation probe.
+dataloader:
+  effective_batch_size: 2
+  num_workers: 0
+trainer:
+  memory_probe: true
+  save_period: 0
+  backup_period: 0
+max_iter: 2
+max_epoch: 1
+lr_scheduler:
+  kwargs:
+    warmup_steps: 0

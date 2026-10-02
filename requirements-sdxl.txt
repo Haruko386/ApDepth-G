@@ -1,0 +1,7 @@
+# Add-ons for the nightly SDXL demo; retain the existing CUDA-enabled PyTorch.
+# CPU integration tested with torch 2.4.1, diffusers 0.35.2, transformers 4.57.0.
+diffusers>=0.35.2,<0.36
+transformers>=4.46,<5
+accelerate>=0.34,<2
+safetensors>=0.4
+bitsandbytes>=0.45.5,<0.51

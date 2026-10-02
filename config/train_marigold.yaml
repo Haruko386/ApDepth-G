@@ -9,6 +9,8 @@ base_config:
 # - config/dataset/dataset_vis.yaml
 - config/model_sdv2.yaml
 
+model:
+  pretrained_path: sd2-1
 
 pipeline:
   name: MarigoldPipeline
@@ -27,21 +29,22 @@ augmentation:
   lr_flip_p: 0.5
 
 dataloader:
-  num_workers: 2
-  effective_batch_size: 32
-  max_train_batch_size: 2
+  num_workers: 7
+  effective_batch_size: 42
+  max_train_batch_size: 7
   seed: 2024  # to ensure continuity when resuming from checkpoint
 
 # Training settings
 trainer:
   name: MarigoldTrainer
   training_noise_scheduler:
-    pretrained_path: stable-diffusion-2
+    pretrained_path: ${model.pretrained_path}
   init_seed: 2024  # use null to train w/o seeding
   save_period: 250
   backup_period: 2000
-  validation_period: 30000
-  visualization_period: 40000
+  # train.py currently does not construct validation/visualization loaders.
+  validation_period: 0
+  visualization_period: 0
 
 multi_res_noise:
   strength: 0.9
@@ -53,7 +56,7 @@ gt_mask_type: valid_mask_raw
 
 # 建议这个数字不要再动
 max_epoch: 10000  # a large enough number to ensure convergence
-max_iter: 23000 # usually converges at around 20k
+max_iter: 23000 # optimizer updates; effective batch 42 (7 x 6)
 
 optimizer:
   name: Adam
@@ -62,6 +65,16 @@ loss:
   name: mse_loss
   kwargs:
     reduction: mean
+
+min_snr_gamma: 5.0
+
+validity_guided_completion:
+  enabled: true
+  mode: residual_snr  # training-only noise-aware residual completion
+  min_invalid_ratio: 0.08
+  anchor_weight: 0.02
+  gradient_weight: 0.005  # squared signed gradient of (prediction - prior)
+  eps: 1.0e-6
 
 lr: 3.0e-05
 lr_scheduler:

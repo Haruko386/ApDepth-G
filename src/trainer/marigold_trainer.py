@@ -23,6 +23,8 @@
 import logging
 import os
 import shutil
+import json
+from contextlib import nullcontext
 from datetime import datetime
 from typing import List, Union
 
@@ -49,6 +51,9 @@ from src.util.metric import MetricTracker
 from src.util.multi_res_noise import multi_res_noise_like
 from src.util.alignment import align_depth_least_square
 from src.util.seeding import generate_seed_sequence
+from src.util.residual_completion import (
+    latent_validity_masks, min_snr_weights, residual_completion_loss,
+)
 
 
 class MarigoldTrainer:
@@ -89,16 +94,40 @@ class MarigoldTrainer:
         self.model.encode_empty_text()
         self.empty_text_embed = self.model.empty_text_embed.detach().clone().to(device)
 
-        self.model.unet.enable_xformers_memory_efficient_attention()
+        if cfg.trainer.get("use_xformers", True):
+            self.model.unet.enable_xformers_memory_efficient_attention()
+        if cfg.trainer.get("gradient_checkpointing", False):
+            self.model.unet.enable_gradient_checkpointing()
+        self.use_bf16 = cfg.trainer.get("mixed_precision", "no") == "bf16"
+        if cfg.trainer.get("mixed_precision", "no") not in ("no", "bf16"):
+            raise ValueError("Training supports FP32 or BF16 autocast with FP32 weights")
+        if self.use_bf16 and (torch.device(device).type != "cuda" or not torch.cuda.is_bf16_supported()):
+            raise ValueError("BF16 demo training requires a BF16-capable CUDA GPU")
+        self.memory_probe = bool(cfg.trainer.get("memory_probe", False))
+        self.report_cuda_memory = bool(cfg.trainer.get("report_cuda_memory", False))
 
         # Trainability
         self.model.vae.requires_grad_(False)
-        self.model.text_encoder.requires_grad_(False)
+        if self.model.text_encoder is not None:
+            self.model.text_encoder.requires_grad_(False)
         self.model.unet.requires_grad_(True)
+        self.model.da2.requires_grad_(False)
+        self.model.da2.eval()
 
         # Optimizer !should be defined after input layer is adapted
         lr = self.cfg.lr
-        self.optimizer = Adam(self.model.unet.parameters(), lr=lr)
+        if cfg.optimizer.name == "Adam8bit":
+            if torch.device(device).type != "cuda":
+                raise ValueError("Adam8bit demo requires CUDA")
+            try:
+                from bitsandbytes.optim import Adam8bit
+            except ImportError as exc:
+                raise ImportError("SDXL demo requires bitsandbytes: pip install bitsandbytes") from exc
+            self.optimizer = Adam8bit(self.model.unet.parameters(), lr=lr)
+        elif cfg.optimizer.name == "Adam":
+            self.optimizer = Adam(self.model.unet.parameters(), lr=lr)
+        else:
+            raise ValueError(f"Unsupported optimizer: {cfg.optimizer.name}")
 
         # LR scheduler
         lr_func = IterExponential(
@@ -122,6 +151,13 @@ class MarigoldTrainer:
         self.vgc_anchor_weight = float(vgc_cfg.get("anchor_weight", 0.02))
         self.vgc_smooth_weight = float(vgc_cfg.get("smooth_weight", 0.005))
         self.vgc_eps = float(vgc_cfg.get("eps", 1e-6))
+        self.vgc_mode = vgc_cfg.get("mode", "legacy")
+        if self.vgc_mode not in ("legacy", "residual_snr"):
+            raise ValueError(f"Unknown completion mode: {self.vgc_mode}")
+        self.vgc_gradient_weight = float(vgc_cfg.get("gradient_weight", 0.005))
+        self.min_snr_gamma = float(self.cfg.get("min_snr_gamma", 5.0))
+        if self.min_snr_gamma <= 0:
+            raise ValueError("min_snr_gamma must be positive")
 
         # Training noise scheduler
         self.training_noise_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
@@ -141,7 +177,11 @@ class MarigoldTrainer:
 
         # Eval metrics
         self.metric_funcs = [getattr(metric, _met) for _met in cfg.eval.eval_metrics]
-        self.train_metrics = MetricTracker(*["loss"])
+        self.train_metrics = MetricTracker(
+            "loss", "diffusion_loss", "latent_gradient_loss", "completion_loss",
+            "completion_anchor", "completion_gradient", "completion_coverage",
+            "completion_snr_weight",
+        )
         self.val_metrics = MetricTracker(*[m.__name__ for m in self.metric_funcs])
         # main metric for best checkpoint saving
         self.main_val_metric = cfg.validation.main_val_metric
@@ -178,27 +218,6 @@ class MarigoldTrainer:
         self.in_evaluation = False
         self.global_seed_sequence: List = []  # consistent global seed sequence, used to seed random generator, to ensure consistency when resuming
 
-    # def _replace_unet_conv_in(self):
-    #     # replace the first layer to accept 8 in_channels
-    #     _weight = self.model.unet.conv_in.weight.clone()  # [320, 4, 3, 3]
-    #     _bias = self.model.unet.conv_in.bias.clone()  # [320]
-    #     _weight = _weight.repeat((1, 2, 1, 1))  # Keep selected channel(s)
-    #     # half the activation magnitude
-    #     _weight *= 0.5
-    #     # new conv_in channel
-    #     _n_convin_out_channel = self.model.unet.conv_in.out_channels
-    #     _new_conv_in = Conv2d(
-    #         8, _n_convin_out_channel, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)
-    #     )
-    #     _new_conv_in.weight = Parameter(_weight)
-    #     _new_conv_in.bias = Parameter(_bias)
-    #     self.model.unet.conv_in = _new_conv_in
-    #     logging.info("Unet conv_in layer is replaced")
-    #     # replace config
-    #     self.model.unet.config["in_channels"] = 8
-    #     logging.info("Unet config is updated")
-    #     return
-    
     # 12 channels
     def _replace_unet_conv_in(self):
         # replace the first layer to accept 12 in_channels
@@ -228,6 +247,8 @@ class MarigoldTrainer:
 
         device = self.device
         self.model.to(device)
+        if self.report_cuda_memory and torch.device(device).type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
 
         if self.in_evaluation:
             logging.info(
@@ -259,14 +280,14 @@ class MarigoldTrainer:
                 # Get data
                 rgb = batch["rgb_norm"].to(device)
                 depth_gt_for_latent = batch[self.gt_depth_type].to(device)
-                da2_depth = self.model.da2.infer_batch(rgb).to(device)
+                with torch.no_grad():
+                    da2_depth = self.model.da2.infer_batch(rgb).to(device)
 
                 if self.gt_mask_type is not None:
                     valid_mask_for_latent = batch[self.gt_mask_type].to(device)
-                    invalid_mask = ~valid_mask_for_latent
-                    valid_mask_down = ~torch.max_pool2d(
-                        invalid_mask.float(), 8, 8
-                    ).bool()
+                    valid_mask_down, invalid_interior_down = latent_validity_masks(
+                        valid_mask_for_latent
+                    )
                     valid_mask_down = valid_mask_down.repeat((1, 4, 1, 1))
                     invalid_mask_down = ~valid_mask_down
                 else:
@@ -336,9 +357,13 @@ class MarigoldTrainer:
                 cat_latents = cat_latents.float()
 
                 # Predict the noise residual
-                model_pred = self.model.unet(
-                    cat_latents, timesteps, text_embed
-                ).sample  # [B, 4, h, w]
+                amp_context = torch.autocast("cuda", dtype=torch.bfloat16) if self.use_bf16 else nullcontext()
+                with amp_context:
+                    if hasattr(self.model, "predict_noise"):
+                        model_pred = self.model.predict_noise(cat_latents, timesteps, text_embed)
+                    else:
+                        model_pred = self.model.unet(cat_latents, timesteps, text_embed).sample
+                model_pred = model_pred.float()
                 
                 if torch.isnan(model_pred).any():
                     logging.warning("model_pred contains NaN.")
@@ -367,9 +392,9 @@ class MarigoldTrainer:
                     pred_x0 = model_pred # sample type
 
             
-                snr = alpha_prod_t / beta_prod_t
-                min_snr_gamma = 5.0
-                snr_weight = torch.clamp(snr, max=min_snr_gamma) / snr
+                snr_weight, completion_snr_weight = min_snr_weights(
+                    alpha_prod_t, self.prediction_type, self.min_snr_gamma
+                )
 
                 diff = model_pred.float() - target.float()
                 if "l1" in self.cfg.loss.name.lower():
@@ -380,7 +405,7 @@ class MarigoldTrainer:
                 unreduced_loss = unreduced_loss * snr_weight
 
                 if self.gt_mask_type is not None:
-                    latent_loss = unreduced_loss[valid_mask_down]
+                    latent_loss = torch.where(valid_mask_down, unreduced_loss, 0.0).sum() / valid_mask_down.sum().clamp_min(1)
                     grad_loss = self.latent_grad_loss(
                         pred_x0.float(), 
                         gt_depth_latent.float(), 
@@ -391,11 +416,22 @@ class MarigoldTrainer:
                     grad_loss = self.latent_grad_loss(pred_x0.float(), gt_depth_latent.float())
 
                 loss = latent_loss.mean() + 0.1 * grad_loss.mean()
+                vgc_loss = loss.new_zeros(())
+                completion_stats = {}
 
-                if self.vgc_enabled:
+                if self.vgc_enabled and self.vgc_mode == "residual_snr":
+                    vgc_loss, completion_stats = residual_completion_loss(
+                        pred_x0, da2_depth_latent, invalid_interior_down,
+                        completion_snr_weight,
+                        anchor_weight=self.vgc_anchor_weight,
+                        gradient_weight=self.vgc_gradient_weight,
+                        min_invalid_ratio=self.vgc_min_invalid_ratio,
+                    )
+                    loss = loss + vgc_loss
+                elif self.vgc_enabled:
                     # VGC only supervises invalid-depth regions. This prevents the
-                    # regularizer from changing NYU-style valid indoor regions, while
-                    # still giving sky / out-of-range regions a weak geometric target.
+                    # regularizer from directly supervising valid pixels. Shared
+                    # U-Net parameters still require indoor regression evaluation.
                     vgc_loss = self._validity_guided_completion_loss(
                         pred_x0=pred_x0.float(),
                         prior_latent=da2_depth_latent.float().detach(),
@@ -404,6 +440,13 @@ class MarigoldTrainer:
                     loss = loss + vgc_loss
 
                 self.train_metrics.update("loss", loss.item())
+                if self.cfg.trainer.get("check_finite_loss", False) and not torch.isfinite(loss):
+                    raise FloatingPointError("Non-finite training loss; stop before corrupting the optimizer")
+                self.train_metrics.update("diffusion_loss", latent_loss.mean().item())
+                self.train_metrics.update("latent_gradient_loss", grad_loss.mean().item())
+                self.train_metrics.update("completion_loss", vgc_loss.item())
+                for name, value in completion_stats.items():
+                    self.train_metrics.update(name, value.item())
 
                 loss = loss / self.gradient_accumulation_steps
                 loss.backward()
@@ -420,6 +463,8 @@ class MarigoldTrainer:
                     accumulated_step = 0
 
                     self.effective_iter += 1
+                    if self.report_cuda_memory and torch.device(device).type == "cuda":
+                        self._report_memory()
 
                     # Log to tensorboard
                     accumulated_loss = self.train_metrics.result()["loss"]
@@ -450,10 +495,11 @@ class MarigoldTrainer:
 
                     # End of training
                     if self.max_iter > 0 and self.effective_iter >= self.max_iter:
-                        self.save_checkpoint(
-                            ckpt_name=self._get_backup_ckpt_name(),
-                            save_train_state=False,
-                        )
+                        if not self.memory_probe:
+                            self.save_checkpoint(
+                                ckpt_name=self._get_backup_ckpt_name(),
+                                save_train_state=False,
+                            )
                         logging.info("Training ended.")
                         return
                     # Time's up
@@ -467,6 +513,30 @@ class MarigoldTrainer:
 
             # Epoch end
             self.n_batch_in_epoch = 0
+
+    def _report_memory(self):
+        torch.cuda.synchronize(self.device)
+        free, total = torch.cuda.mem_get_info(self.device)
+        gib = 1024 ** 3
+        record = {
+            "effective_iter": self.effective_iter,
+            "gpu": torch.cuda.get_device_name(self.device),
+            "allocated_gib": torch.cuda.memory_allocated(self.device) / gib,
+            "peak_allocated_gib": torch.cuda.max_memory_allocated(self.device) / gib,
+            "peak_reserved_gib": torch.cuda.max_memory_reserved(self.device) / gib,
+            "device_free_gib": free / gib, "device_total_gib": total / gib,
+            "backbone": self.cfg.model.get("backbone", "sd2"),
+            "optimizer": self.cfg.optimizer.name,
+            "unet_parameters": sum(p.numel() for p in self.model.unet.parameters()),
+            "mixed_precision": self.cfg.trainer.get("mixed_precision", "no"),
+            "gradient_checkpointing": self.cfg.trainer.get("gradient_checkpointing", False),
+            "microbatch": self.cfg.dataloader.max_train_batch_size,
+            "accumulation_steps": self.accumulation_steps,
+        }
+        logging.info("CUDA memory: %s", json.dumps(record))
+        path = os.path.join(self.out_dir_ckpt, "..", "memory_profile.json")
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(record, stream, indent=2)
 
     def _validity_guided_completion_loss(self, pred_x0, prior_latent, invalid_mask):
         """Weakly complete invalid-depth regions using the detached DA2 prior.
@@ -778,14 +848,14 @@ class MarigoldTrainer:
         # Load UNet
         _model_path = os.path.join(ckpt_path, "unet", "diffusion_pytorch_model.bin")
         self.model.unet.load_state_dict(
-            torch.load(_model_path, map_location=self.device)
+            torch.load(_model_path, map_location="cpu", weights_only=True)
         )
         self.model.unet.to(self.device)
         logging.info(f"UNet parameters are loaded from {_model_path}")
 
         # Load training states
         if load_trainer_state:
-            checkpoint = torch.load(os.path.join(ckpt_path, "trainer.ckpt"))
+            checkpoint = torch.load(os.path.join(ckpt_path, "trainer.ckpt"), map_location="cpu", weights_only=False)
             self.effective_iter = checkpoint["effective_iter"]
             self.epoch = checkpoint["epoch"]
             self.n_batch_in_epoch = checkpoint["n_batch_in_epoch"]
