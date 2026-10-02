@@ -57,7 +57,8 @@ if "__main__" == __name__:
     )
 
     # dataset setting
-    parser.add_argument("--unet_checkpoint", help="Original VGC checkpoint containing unet/")
+    parser.add_argument("--backbone", choices=["sd2", "sdxl"], default="sd2")
+    parser.add_argument("--unet_checkpoint", help="Matching backbone checkpoint containing unet/")
     parser.add_argument("--decoder_checkpoint", help="Calibration directory containing vae/")
     parser.add_argument(
         "--dataset_config",
@@ -208,8 +209,9 @@ if "__main__" == __name__:
         dtype = torch.float32
         variant = None
 
-    pipe = MarigoldPipeline.from_pretrained(
-        checkpoint_path, variant=variant, torch_dtype=dtype
+    from src.util.pipeline_loader import load_depth_pipeline
+    pipe = load_depth_pipeline(
+        checkpoint_path, backbone=args.backbone, variant=variant, torch_dtype=dtype
     )
     apply_model_overrides(pipe, args.unet_checkpoint, args.decoder_checkpoint)
     # unet = UNet2DConditionModel.from_pretrained(os.path.join(checkpoint_path, f'unet'))

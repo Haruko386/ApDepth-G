@@ -1,0 +1,29 @@
+base_config:
+- config/train_marigold.yaml
+
+model:
+  backbone: sdxl
+  pretrained_path: stable-diffusion-xl-base-1.0
+  latent_scale_factor: 0.13025 # documentation; actual value read from VAE config
+
+pipeline:
+  name: SDXLDepthPipeline
+
+dataloader:
+  effective_batch_size: 42
+  max_train_batch_size: 1
+  num_workers: 4
+
+trainer:
+  use_xformers: false # PyTorch SDPA (Diffusers default attention processor)
+  gradient_checkpointing: true
+  mixed_precision: bf16
+  report_cuda_memory: true
+  check_finite_loss: true
+
+optimizer:
+  name: Adam8bit
+
+# Full U-Net tuning. Start more conservatively than the SD2 experiment.
+lr: 1.0e-5
+max_iter: 23000

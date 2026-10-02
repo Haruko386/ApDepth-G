@@ -47,7 +47,6 @@ from .util.image_util import (
     get_tv_resample_method,
     resize_max_res,
 )
-from DA2.depth_anything_v2.dpt import DepthAnythingV2
 
 class MarigoldDepthOutput(BaseOutput):
     """
@@ -144,18 +143,21 @@ class MarigoldPipeline(DiffusionPipeline):
 
         self.empty_text_embed = None
 
+        self.da2 = self._load_depth_prior()
+
+    @staticmethod
+    def _load_depth_prior():
+        # Lazy import also keeps help/config inspection available without DA2.
+        from DA2.depth_anything_v2.dpt import DepthAnythingV2
         da2_config = {
             'encoder':'vitg',
             'features': 384,
             'out_channels': [1536, 1536, 1536, 1536]
         }
 
-        if da2_config is not None:
-            self.da2 = DepthAnythingV2(**da2_config)
-            self.da2.load_state_dict(torch.load(f'DA2/checkpoints/depth_anything_v2_{da2_config["encoder"]}.pth', map_location='cpu'))
-            self.da2.to(device="cuda")
-        else:
-            self.da2 = None
+        prior = DepthAnythingV2(**da2_config)
+        prior.load_state_dict(torch.load(f'DA2/checkpoints/depth_anything_v2_{da2_config["encoder"]}.pth', map_location='cpu', weights_only=True))
+        return prior.to(device="cuda").requires_grad_(False).eval()
 
     @torch.no_grad()
     def __call__(
@@ -446,9 +448,9 @@ class MarigoldPipeline(DiffusionPipeline):
             )  # this order is important
 
             # predict the noise residual
-            noise_pred = self.unet(
-                unet_input, t, encoder_hidden_states=batch_empty_text_embed
-            ).sample  # [B, 4, h, w]
+            noise_pred = self.predict_noise(
+                unet_input, t, batch_empty_text_embed
+            )  # [B, 4, h, w]
 
             # compute the previous noisy sample x_t -> x_t-1
             depth_latent = self.scheduler.step(
@@ -463,6 +465,9 @@ class MarigoldPipeline(DiffusionPipeline):
         depth = (depth + 1.0) / 2.0
 
         return depth
+
+    def predict_noise(self, latents, timesteps, text_embed):
+        return self.unet(latents, timesteps, encoder_hidden_states=text_embed).sample
 
     def encode_rgb(self, rgb_in: torch.Tensor) -> torch.Tensor:
         """

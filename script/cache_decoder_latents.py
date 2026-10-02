@@ -7,6 +7,7 @@ from pathlib import Path
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base_checkpoint", required=True, help="Full SD2 pipeline used by original VGC")
+    parser.add_argument("--backbone", choices=["sd2", "sdxl"], default="sd2")
     parser.add_argument("--unet_checkpoint", required=True, help="Original VGC checkpoint containing unet/")
     parser.add_argument("--manifest", required=True, help="RGB/semantic mask JSONL, with train/val splits")
     parser.add_argument("--output_dir", required=True)
@@ -21,8 +22,9 @@ def main():
     import torch
     import torch.nn.functional as F
     from PIL import Image
-    from diffusers import DDIMScheduler, UNet2DConditionModel
-    from marigold import MarigoldPipeline
+    from diffusers import DDIMScheduler
+    from src.util.pipeline_loader import load_depth_pipeline
+    from src.util.model_overrides import apply_model_overrides
     from src.util.decoder_calibration import read_manifest, read_labels, capture_terminal_prediction
 
     rows = read_manifest(args.manifest)
@@ -32,20 +34,21 @@ def main():
             read_labels(row["mask"], rgb.size)
     destination = Path(args.output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=False)
-    pipe = MarigoldPipeline.from_pretrained(args.base_checkpoint, torch_dtype=torch.float32)
-    pipe.unet = UNet2DConditionModel.from_pretrained(Path(args.unet_checkpoint) / "unet")
+    pipe = load_depth_pipeline(args.base_checkpoint, backbone=args.backbone, torch_dtype=torch.float32)
+    apply_model_overrides(pipe, args.unet_checkpoint)
     if pipe.unet.config.in_channels != 12 or not isinstance(pipe.scheduler, DDIMScheduler):
         raise ValueError("Use original 12-channel VGC with a DDIM scheduler")
     pipe.to(args.device)
     for module in (pipe.unet, pipe.vae, pipe.text_encoder, pipe.da2):
-        module.requires_grad_(False).eval()
+        if module is not None:
+            module.requires_grad_(False).eval()
     try:
         pipe.enable_xformers_memory_efficient_attention()
     except (ImportError, ModuleNotFoundError):
         pass
     # Snapshot the exact VAE: decoder fitting needs neither SD2 U-Net nor DA2.
     pipe.vae.save_pretrained(destination / "source_vae")
-    metadata = {"version": 1, "base_checkpoint": str(Path(args.base_checkpoint).resolve()),
+    metadata = {"version": 1, "backbone": args.backbone, "base_checkpoint": str(Path(args.base_checkpoint).resolve()),
                 "unet_checkpoint": str(Path(args.unet_checkpoint).resolve()),
                 "steps": args.steps, "processing_res": args.processing_res,
                 "seeds": args.seeds, "depth_latent_scale_factor": pipe.depth_latent_scale_factor,

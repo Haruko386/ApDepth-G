@@ -23,6 +23,8 @@
 import logging
 import os
 import shutil
+import json
+from contextlib import nullcontext
 from datetime import datetime
 from typing import List, Union
 
@@ -92,18 +94,40 @@ class MarigoldTrainer:
         self.model.encode_empty_text()
         self.empty_text_embed = self.model.empty_text_embed.detach().clone().to(device)
 
-        self.model.unet.enable_xformers_memory_efficient_attention()
+        if cfg.trainer.get("use_xformers", True):
+            self.model.unet.enable_xformers_memory_efficient_attention()
+        if cfg.trainer.get("gradient_checkpointing", False):
+            self.model.unet.enable_gradient_checkpointing()
+        self.use_bf16 = cfg.trainer.get("mixed_precision", "no") == "bf16"
+        if cfg.trainer.get("mixed_precision", "no") not in ("no", "bf16"):
+            raise ValueError("Training supports FP32 or BF16 autocast with FP32 weights")
+        if self.use_bf16 and (torch.device(device).type != "cuda" or not torch.cuda.is_bf16_supported()):
+            raise ValueError("BF16 demo training requires a BF16-capable CUDA GPU")
+        self.memory_probe = bool(cfg.trainer.get("memory_probe", False))
+        self.report_cuda_memory = bool(cfg.trainer.get("report_cuda_memory", False))
 
         # Trainability
         self.model.vae.requires_grad_(False)
-        self.model.text_encoder.requires_grad_(False)
+        if self.model.text_encoder is not None:
+            self.model.text_encoder.requires_grad_(False)
         self.model.unet.requires_grad_(True)
         self.model.da2.requires_grad_(False)
         self.model.da2.eval()
 
         # Optimizer !should be defined after input layer is adapted
         lr = self.cfg.lr
-        self.optimizer = Adam(self.model.unet.parameters(), lr=lr)
+        if cfg.optimizer.name == "Adam8bit":
+            if torch.device(device).type != "cuda":
+                raise ValueError("Adam8bit demo requires CUDA")
+            try:
+                from bitsandbytes.optim import Adam8bit
+            except ImportError as exc:
+                raise ImportError("SDXL demo requires bitsandbytes: pip install bitsandbytes") from exc
+            self.optimizer = Adam8bit(self.model.unet.parameters(), lr=lr)
+        elif cfg.optimizer.name == "Adam":
+            self.optimizer = Adam(self.model.unet.parameters(), lr=lr)
+        else:
+            raise ValueError(f"Unsupported optimizer: {cfg.optimizer.name}")
 
         # LR scheduler
         lr_func = IterExponential(
@@ -223,6 +247,8 @@ class MarigoldTrainer:
 
         device = self.device
         self.model.to(device)
+        if self.report_cuda_memory and torch.device(device).type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
 
         if self.in_evaluation:
             logging.info(
@@ -331,9 +357,13 @@ class MarigoldTrainer:
                 cat_latents = cat_latents.float()
 
                 # Predict the noise residual
-                model_pred = self.model.unet(
-                    cat_latents, timesteps, text_embed
-                ).sample  # [B, 4, h, w]
+                amp_context = torch.autocast("cuda", dtype=torch.bfloat16) if self.use_bf16 else nullcontext()
+                with amp_context:
+                    if hasattr(self.model, "predict_noise"):
+                        model_pred = self.model.predict_noise(cat_latents, timesteps, text_embed)
+                    else:
+                        model_pred = self.model.unet(cat_latents, timesteps, text_embed).sample
+                model_pred = model_pred.float()
                 
                 if torch.isnan(model_pred).any():
                     logging.warning("model_pred contains NaN.")
@@ -410,6 +440,8 @@ class MarigoldTrainer:
                     loss = loss + vgc_loss
 
                 self.train_metrics.update("loss", loss.item())
+                if self.cfg.trainer.get("check_finite_loss", False) and not torch.isfinite(loss):
+                    raise FloatingPointError("Non-finite training loss; stop before corrupting the optimizer")
                 self.train_metrics.update("diffusion_loss", latent_loss.mean().item())
                 self.train_metrics.update("latent_gradient_loss", grad_loss.mean().item())
                 self.train_metrics.update("completion_loss", vgc_loss.item())
@@ -431,6 +463,8 @@ class MarigoldTrainer:
                     accumulated_step = 0
 
                     self.effective_iter += 1
+                    if self.report_cuda_memory and torch.device(device).type == "cuda":
+                        self._report_memory()
 
                     # Log to tensorboard
                     accumulated_loss = self.train_metrics.result()["loss"]
@@ -461,10 +495,11 @@ class MarigoldTrainer:
 
                     # End of training
                     if self.max_iter > 0 and self.effective_iter >= self.max_iter:
-                        self.save_checkpoint(
-                            ckpt_name=self._get_backup_ckpt_name(),
-                            save_train_state=False,
-                        )
+                        if not self.memory_probe:
+                            self.save_checkpoint(
+                                ckpt_name=self._get_backup_ckpt_name(),
+                                save_train_state=False,
+                            )
                         logging.info("Training ended.")
                         return
                     # Time's up
@@ -478,6 +513,30 @@ class MarigoldTrainer:
 
             # Epoch end
             self.n_batch_in_epoch = 0
+
+    def _report_memory(self):
+        torch.cuda.synchronize(self.device)
+        free, total = torch.cuda.mem_get_info(self.device)
+        gib = 1024 ** 3
+        record = {
+            "effective_iter": self.effective_iter,
+            "gpu": torch.cuda.get_device_name(self.device),
+            "allocated_gib": torch.cuda.memory_allocated(self.device) / gib,
+            "peak_allocated_gib": torch.cuda.max_memory_allocated(self.device) / gib,
+            "peak_reserved_gib": torch.cuda.max_memory_reserved(self.device) / gib,
+            "device_free_gib": free / gib, "device_total_gib": total / gib,
+            "backbone": self.cfg.model.get("backbone", "sd2"),
+            "optimizer": self.cfg.optimizer.name,
+            "unet_parameters": sum(p.numel() for p in self.model.unet.parameters()),
+            "mixed_precision": self.cfg.trainer.get("mixed_precision", "no"),
+            "gradient_checkpointing": self.cfg.trainer.get("gradient_checkpointing", False),
+            "microbatch": self.cfg.dataloader.max_train_batch_size,
+            "accumulation_steps": self.accumulation_steps,
+        }
+        logging.info("CUDA memory: %s", json.dumps(record))
+        path = os.path.join(self.out_dir_ckpt, "..", "memory_profile.json")
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(record, stream, indent=2)
 
     def _validity_guided_completion_loss(self, pred_x0, prior_latent, invalid_mask):
         """Weakly complete invalid-depth regions using the detached DA2 prior.
@@ -789,14 +848,14 @@ class MarigoldTrainer:
         # Load UNet
         _model_path = os.path.join(ckpt_path, "unet", "diffusion_pytorch_model.bin")
         self.model.unet.load_state_dict(
-            torch.load(_model_path, map_location=self.device)
+            torch.load(_model_path, map_location="cpu", weights_only=True)
         )
         self.model.unet.to(self.device)
         logging.info(f"UNet parameters are loaded from {_model_path}")
 
         # Load training states
         if load_trainer_state:
-            checkpoint = torch.load(os.path.join(ckpt_path, "trainer.ckpt"))
+            checkpoint = torch.load(os.path.join(ckpt_path, "trainer.ckpt"), map_location="cpu", weights_only=False)
             self.effective_iter = checkpoint["effective_iter"]
             self.epoch = checkpoint["epoch"]
             self.n_batch_in_epoch = checkpoint["n_batch_in_epoch"]

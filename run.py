@@ -58,7 +58,8 @@ if "__main__" == __name__:
         required=True,
         help="Path to the input image folder.",
     )
-    parser.add_argument("--unet_checkpoint", help="Original VGC checkpoint containing unet/")
+    parser.add_argument("--backbone", choices=["sd2", "sdxl"], default="sd2")
+    parser.add_argument("--unet_checkpoint", help="Matching backbone checkpoint containing unet/")
     parser.add_argument("--decoder_checkpoint", help="Calibration best/ or step_XXXXXX/ directory containing vae/")
 
     parser.add_argument(
@@ -209,8 +210,9 @@ if "__main__" == __name__:
         dtype = torch.float32
         variant = None
 
-    pipe: MarigoldPipeline = MarigoldPipeline.from_pretrained(
-        checkpoint_path, variant=variant, torch_dtype=dtype
+    from src.util.pipeline_loader import load_depth_pipeline
+    pipe = load_depth_pipeline(
+        checkpoint_path, backbone=args.backbone, variant=variant, torch_dtype=dtype
     )
     apply_model_overrides(pipe, args.unet_checkpoint, args.decoder_checkpoint)
     # unet = UNet2DConditionModel.from_pretrained(os.path.join(checkpoint_path, f'unet'))

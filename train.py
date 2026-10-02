@@ -53,6 +53,7 @@ from src.util.logging_util import (
     tb_logger,
 )
 from src.util.slurm_util import get_local_scratch_dir, is_on_slurm
+from src.util.pipeline_loader import load_depth_pipeline
 
 if "__main__" == __name__:
     t_start = datetime.now()
@@ -267,7 +268,20 @@ if "__main__" == __name__:
         depth_transform=depth_transform,
     )
     logging.debug("Augmentation: ", cfg.augmentation)
-    if "mixed" == cfg_data.train.name:
+    if cfg.trainer.get("memory_probe", False):
+        # Alternate real samples from every dataset. Batch one supports distinct
+        # HyperSim / VKITTI shapes and probes both with allocated optimizer state.
+        dataset_ls = train_dataset if isinstance(train_dataset, list) else [train_dataset]
+        concat_dataset = ConcatDataset(dataset_ls)
+        offsets, offset = [], 0
+        for dataset in dataset_ls:
+            offsets.append(offset)
+            offset += len(dataset)
+        subset = torch.utils.data.Subset(concat_dataset, offsets * 2)
+        if cfg.dataloader.max_train_batch_size != 1 or accumulation_steps != len(dataset_ls):
+            raise ValueError("Memory probe requires batch 1 and one accumulated sample per dataset")
+        train_loader = DataLoader(subset, batch_size=1, num_workers=0)
+    elif "mixed" == cfg_data.train.name:
         dataset_ls = train_dataset
         assert len(cfg_data.train.prob_ls) == len(
             dataset_ls
@@ -336,8 +350,9 @@ if "__main__" == __name__:
     # }
      
     _pipeline_kwargs = cfg.pipeline.kwargs if cfg.pipeline.kwargs is not None else {}
-    model = MarigoldPipeline.from_pretrained(
-        os.path.join(base_ckpt_dir, cfg.model.pretrained_path), **_pipeline_kwargs
+    model = load_depth_pipeline(
+        os.path.join(base_ckpt_dir, cfg.model.pretrained_path),
+        backbone=cfg.model.get("backbone", "sd2"), **_pipeline_kwargs
     )
 
     # -------------------- Trainer --------------------
@@ -373,3 +388,4 @@ if "__main__" == __name__:
         trainer.train(t_end=t_end)
     except Exception as e:
         logging.exception(e)
+        raise

@@ -12,6 +12,8 @@ def apply_model_overrides(pipe, unet_checkpoint=None, decoder_checkpoint=None):
         unet = UNet2DConditionModel.from_pretrained(path / "unet", torch_dtype=pipe.unet.dtype)
         if unet.config.in_channels != 12:
             raise ValueError("Expected a trained 12-channel VGC U-Net")
+        if unet.config.get("addition_embed_type") != pipe.unet.config.get("addition_embed_type"):
+            raise ValueError("U-Net backbone mismatch: select --backbone matching the checkpoint")
         pipe.unet = unet
     if decoder_checkpoint:
         if pipe.unet.config.in_channels != 12:
@@ -19,6 +21,8 @@ def apply_model_overrides(pipe, unet_checkpoint=None, decoder_checkpoint=None):
         path = Path(decoder_checkpoint)
         vae_path = path / "vae" if (path / "vae").is_dir() else path
         calibrated = AutoencoderKL.from_pretrained(vae_path, torch_dtype=pipe.vae.dtype)
+        if calibrated.config.scaling_factor != pipe.vae.config.scaling_factor:
+            raise ValueError("Calibration source VAE mismatch: scaling_factor")
         # Conditioning must use the same frozen encoder/post-quant transform
         # that generated the cache. Fail instead of silently changing latents.
         for name in ("encoder", "quant_conv", "post_quant_conv"):
