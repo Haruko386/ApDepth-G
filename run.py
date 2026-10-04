@@ -31,13 +31,11 @@ from PIL import Image
 from tqdm.auto import tqdm
 
 from marigold import MarigoldPipeline
+from src.util.model_overrides import load_unet_checkpoint
 
 EXTENSION_LIST = [".jpg", ".jpeg", ".png"]
 
 from torchvision import transforms
-from marigold.modules.unet_2d_condition import UNet2DConditionModel
-
-
 if "__main__" == __name__:
     logging.basicConfig(level=logging.INFO)
 
@@ -50,6 +48,12 @@ if "__main__" == __name__:
         type=str,
         default="prs-eth/marigold-lcm-v1-0",
         help="Checkpoint path or hub name.",
+    )
+    parser.add_argument(
+        "--unet_checkpoint",
+        type=str,
+        default=None,
+        help="Training checkpoint directory containing unet/ and depth_parameterization.json.",
     )
 
     parser.add_argument(
@@ -210,8 +214,9 @@ if "__main__" == __name__:
     pipe: MarigoldPipeline = MarigoldPipeline.from_pretrained(
         checkpoint_path, variant=variant, torch_dtype=dtype
     )
-    # unet = UNet2DConditionModel.from_pretrained(os.path.join(checkpoint_path, f'unet'))
-    # pipe.unet = unet
+    if args.unet_checkpoint:
+        mode, scale = load_unet_checkpoint(pipe, args.unet_checkpoint, dtype)
+        logging.info("Loaded depth parameterization: %s (scale=%s)", mode, scale)
 
     try:
         pipe.enable_xformers_memory_efficient_attention()
@@ -219,6 +224,9 @@ if "__main__" == __name__:
         pass  # run without xformers
 
     pipe = pipe.to(device)
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=device).manual_seed(seed)
     logging.info(
         f"scale_invariant: {pipe.scale_invariant}, shift_invariant: {pipe.shift_invariant}"
     )
@@ -253,6 +261,7 @@ if "__main__" == __name__:
                 color_map=color_map,
                 show_progress_bar=True,
                 resample_method=resample_method,
+                generator=generator,
             )
 
             depth_pred: np.ndarray = pipe_out.depth_np

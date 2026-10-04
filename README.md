@@ -162,25 +162,48 @@ export BASE_DATA_DIR=YOUR_DATA_DIR  # directory of training data
 export BASE_CKPT_DIR=YOUR_CHECKPOINT_DIR  # directory of pretrained checkpoint
 ```
 
-Download Stable Diffusion v2 [checkpoint](https://huggingface.co/stabilityai/stable-diffusion-2) into `${BASE_CKPT_DIR}`
+Download Stable Diffusion v2 [checkpoint](https://huggingface.co/stabilityai/stable-diffusion-2)
+into `${BASE_CKPT_DIR}/sd2-1`.
 
 Prepare for [Hypersim](https://github.com/apple/ml-hypersim) and [Virtual KITTI 2](https://europe.naverlabs.com/research/computer-vision/proxy-virtual-worlds-vkitti-2/) datasets and save into `${BASE_DATA_DIR}`. Please refer to [this README](script/dataset_preprocess/hypersim/README.md) for Hypersim preprocessing.
 
-Run training script
+The `master` experiment uses **Prior-Anchored Residual Diffusion**. DDIM predicts a
+multi-step correction around the frozen DA2 prior instead of an unconstrained absolute
+depth latent. Original VGC remains enabled and no new sky label is required. See the
+[experiment note](doc/prior_anchored_residual_diffusion.md).
+
+Start a new run from SD2; do not resume an absolute-depth VGC checkpoint:
 
 ```bash
-python train.py --config config/train_marigold.yaml --no_wandb
+python train.py \
+  --config config/train_marigold.yaml \
+  --base_data_dir "${BASE_DATA_DIR}" \
+  --base_ckpt_dir "${BASE_CKPT_DIR}" \
+  --output_dir output/unet_prior_residual_v1 \
+  --no_wandb
 ```
 
-Resume from a checkpoint, e.g.
+Resume only the same residual-diffusion run:
 
 ```bash
-python train.py --resume_run output/train_marigold/checkpoint/latest --no_wandb
+python train.py \
+  --resume_run output/unet_prior_residual_v1/train_marigold/checkpoint/latest \
+  --base_data_dir "${BASE_DATA_DIR}" \
+  --base_ckpt_dir "${BASE_CKPT_DIR}" \
+  --no_wandb
 ```
 
-Evaluating results
+Evaluate with the checkpoint parent directory so `unet/` and
+`depth_parameterization.json` are loaded together:
 
-Only the U-Net is updated and saved during training. To use the inference pipeline with your training result, replace `unet` folder in Marigold checkpoints with that in the `checkpoint` output folder. Then refer to [this section](#evaluation) for evaluation.
+```bash
+python run.py \
+  --checkpoint "${BASE_CKPT_DIR}/sd2-1" \
+  --unet_checkpoint output/unet_prior_residual_v1/train_marigold/checkpoint/iter_004000 \
+  --input_rgb_dir output/out \
+  --output_dir output/prior_residual_004000 \
+  --denoise_steps 50 --ensemble_size 1 --processing_res 768 --seed 2024
+```
 
 > [!IMPORTANT]
 >

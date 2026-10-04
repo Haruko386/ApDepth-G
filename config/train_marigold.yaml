@@ -9,6 +9,8 @@ base_config:
 # - config/dataset/dataset_vis.yaml
 - config/model_sdv2.yaml
 
+model:
+  pretrained_path: sd2-1
 
 pipeline:
   name: MarigoldPipeline
@@ -36,7 +38,7 @@ dataloader:
 trainer:
   name: MarigoldTrainer
   training_noise_scheduler:
-    pretrained_path: stable-diffusion-2
+    pretrained_path: ${model.pretrained_path}
   init_seed: 2024  # use null to train w/o seeding
   save_period: 250
   backup_period: 2000
@@ -62,6 +64,19 @@ loss:
   name: mse_loss
   kwargs:
     reduction: mean
+
+# Denoise a correction around the frozen DA2 prior instead of generating an
+# unconstrained absolute depth latent. Inference composes prior + residual.
+depth_parameterization:
+  mode: prior_residual
+  residual_scale: 1.0
+
+validity_guided_completion:
+  enabled: true
+  min_invalid_ratio: 0.08
+  anchor_weight: 0.02
+  smooth_weight: 0.005
+  eps: 1.0e-6
 
 lr: 3.0e-05
 lr_scheduler:

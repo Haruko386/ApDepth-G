@@ -38,6 +38,9 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms.functional import pil_to_tensor, resize
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
+from src.util.prior_residual import (
+    ABSOLUTE, compose_depth_latent, validate_parameterization,
+)
 
 from .util.batchsize import find_batch_size
 from .util.ensemble import ensemble_depth
@@ -143,6 +146,7 @@ class MarigoldPipeline(DiffusionPipeline):
         self.default_processing_resolution = default_processing_resolution
 
         self.empty_text_embed = None
+        self.set_depth_parameterization(ABSOLUTE, 1.0)
 
         da2_config = {
             'encoder':'vitg',
@@ -379,6 +383,12 @@ class MarigoldPipeline(DiffusionPipeline):
         text_input_ids = text_inputs.input_ids.to(self.text_encoder.device)
         self.empty_text_embed = self.text_encoder(text_input_ids)[0].to(self.dtype)
 
+    def set_depth_parameterization(self, mode, residual_scale=1.0):
+        """Select whether DDIM denoises absolute depth or a DA2-centered residual."""
+        mode, scale = validate_parameterization(mode, residual_scale)
+        self.depth_prediction_mode = mode
+        self.depth_residual_scale = scale
+
     @torch.no_grad()
     def single_infer(
         self,
@@ -414,8 +424,8 @@ class MarigoldPipeline(DiffusionPipeline):
         rgb_latent = self.encode_rgb(rgb_in)
         da2_depth_latent = self.encode_rgb(da2_depth)
 
-        # Initial depth map (noise)
-        depth_latent = torch.randn(
+        # Initial diffusion state (absolute depth or a DA2-centered residual).
+        state_latent = torch.randn(
             rgb_latent.shape,
             device=device,
             dtype=self.dtype,
@@ -442,7 +452,7 @@ class MarigoldPipeline(DiffusionPipeline):
 
         for i, t in iterable:
             unet_input = torch.cat(
-                [rgb_latent, da2_depth_latent, depth_latent], dim=1
+                [rgb_latent, da2_depth_latent, state_latent], dim=1
             )  # this order is important
 
             # predict the noise residual
@@ -451,10 +461,16 @@ class MarigoldPipeline(DiffusionPipeline):
             ).sample  # [B, 4, h, w]
 
             # compute the previous noisy sample x_t -> x_t-1
-            depth_latent = self.scheduler.step(
-                noise_pred, t, depth_latent, generator=generator
+            state_latent = self.scheduler.step(
+                noise_pred, t, state_latent, generator=generator
             ).prev_sample
 
+        depth_latent = compose_depth_latent(
+            state_latent,
+            da2_depth_latent,
+            self.depth_prediction_mode,
+            self.depth_residual_scale,
+        )
         depth = self.decode_depth(depth_latent)
 
         # clip prediction

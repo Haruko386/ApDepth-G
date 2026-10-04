@@ -32,6 +32,7 @@ from tqdm.auto import tqdm
 
 from marigold import MarigoldPipeline
 from src.util.seeding import seed_all
+from src.util.model_overrides import load_unet_checkpoint
 from src.dataset import (
     BaseDepthDataset,
     DatasetMode,
@@ -53,6 +54,12 @@ if "__main__" == __name__:
         type=str,
         default="prs-eth/marigold-v1-0",
         help="Checkpoint path or hub name.",
+    )
+    parser.add_argument(
+        "--unet_checkpoint",
+        type=str,
+        default=None,
+        help="Training checkpoint directory containing unet/ and depth_parameterization.json.",
     )
 
     # dataset setting
@@ -208,8 +215,9 @@ if "__main__" == __name__:
     pipe = MarigoldPipeline.from_pretrained(
         checkpoint_path, variant=variant, torch_dtype=dtype
     )
-    # unet = UNet2DConditionModel.from_pretrained(os.path.join(checkpoint_path, f'unet'))
-    # pipe.unet = unet
+    if args.unet_checkpoint:
+        mode, scale = load_unet_checkpoint(pipe, args.unet_checkpoint, dtype)
+        logging.info("Loaded depth parameterization: %s (scale=%s)", mode, scale)
         
 
     try:

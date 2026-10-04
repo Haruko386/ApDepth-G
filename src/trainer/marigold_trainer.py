@@ -49,6 +49,10 @@ from src.util.metric import MetricTracker
 from src.util.multi_res_noise import multi_res_noise_like
 from src.util.alignment import align_depth_least_square
 from src.util.seeding import generate_seed_sequence
+from src.util.prior_residual import (
+    compose_depth_latent, diffusion_target,
+    load_parameterization, save_parameterization, validate_parameterization,
+)
 
 
 class MarigoldTrainer:
@@ -95,6 +99,8 @@ class MarigoldTrainer:
         self.model.vae.requires_grad_(False)
         self.model.text_encoder.requires_grad_(False)
         self.model.unet.requires_grad_(True)
+        self.model.da2.requires_grad_(False)
+        self.model.da2.eval()
 
         # Optimizer !should be defined after input layer is adapted
         lr = self.cfg.lr
@@ -111,6 +117,15 @@ class MarigoldTrainer:
         # Loss
         self.loss = get_loss(loss_name=self.cfg.loss.name, **self.cfg.loss.kwargs)
         self.latent_grad_loss = LatentGradLoss()
+
+        parameterization_cfg = self.cfg.get("depth_parameterization", {})
+        self.depth_prediction_mode, self.depth_residual_scale = validate_parameterization(
+            parameterization_cfg.get("mode", "absolute"),
+            parameterization_cfg.get("residual_scale", 1.0),
+        )
+        self.model.set_depth_parameterization(
+            self.depth_prediction_mode, self.depth_residual_scale
+        )
 
         # Validity-Guided Completion (VGC)
         # This is a mask-free sky-collapse regularizer: it does not use sky masks
@@ -204,15 +219,23 @@ class MarigoldTrainer:
         # replace the first layer to accept 12 in_channels
         _weight = self.model.unet.conv_in.weight.clone()  # [320, 4, 3, 3]
         _bias = self.model.unet.conv_in.bias.clone()      # [320]
-        _weight = _weight.repeat((1, 3, 1, 1))  
-
-        _weight *= (1.0 / 3.0)
+        # Preserve the standard RGB + noisy-state initialization exactly and let
+        # the DA2 conditioning branch enter gradually. DA2 already anchors the
+        # residual output, so injecting it a second time at full strength creates
+        # an avoidable shortcut at iteration zero.
+        _new_weight = torch.zeros(
+            (_weight.shape[0], 12, *_weight.shape[2:]),
+            device=_weight.device,
+            dtype=_weight.dtype,
+        )
+        _new_weight[:, 0:4] = 0.5 * _weight
+        _new_weight[:, 8:12] = 0.5 * _weight
         
         _n_convin_out_channel = self.model.unet.conv_in.out_channels
         _new_conv_in = Conv2d(
             12, _n_convin_out_channel, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)
         )
-        _new_conv_in.weight = Parameter(_weight)
+        _new_conv_in.weight = Parameter(_new_weight)
         _new_conv_in.bias = Parameter(_bias)
         self.model.unet.conv_in = _new_conv_in
         
@@ -259,7 +282,8 @@ class MarigoldTrainer:
                 # Get data
                 rgb = batch["rgb_norm"].to(device)
                 depth_gt_for_latent = batch[self.gt_depth_type].to(device)
-                da2_depth = self.model.da2.infer_batch(rgb).to(device)
+                with torch.no_grad():
+                    da2_depth = self.model.da2.infer_batch(rgb).to(device)
 
                 if self.gt_mask_type is not None:
                     valid_mask_for_latent = batch[self.gt_mask_type].to(device)
@@ -283,6 +307,13 @@ class MarigoldTrainer:
                     )  # [B, 4, h, w]
                     # Encode DA2 depth
                     da2_depth_latent = self.model.encode_rgb(da2_depth)  # [B, 4, h, w]
+
+                target_state_latent = diffusion_target(
+                    gt_depth_latent,
+                    da2_depth_latent,
+                    self.depth_prediction_mode,
+                    self.depth_residual_scale,
+                )
                 
                 # Sample a random timestep for each image
                 timesteps = torch.randint(
@@ -298,7 +329,7 @@ class MarigoldTrainer:
                     if self.annealed_mr_noise:
                         strength = strength * (timesteps / self.scheduler_timesteps)
                     noise = multi_res_noise_like(
-                        gt_depth_latent,
+                        target_state_latent,
                         strength=strength,
                         downscale_strategy=self.mr_noise_downscale_strategy,
                         generator=rand_num_generator,
@@ -306,7 +337,7 @@ class MarigoldTrainer:
                     )
                 else:
                     noise = torch.randn(
-                        gt_depth_latent.shape,
+                        target_state_latent.shape,
                         device=device,
                         generator=rand_num_generator,
                     )  # [B, 4, h, w]
@@ -321,7 +352,7 @@ class MarigoldTrainer:
 
                 # Add noise to the latents (diffusion forward process)
                 noisy_latents = self.training_noise_scheduler.add_noise(
-                    gt_depth_latent, noise, timesteps
+                    target_state_latent, noise, timesteps
                 )  # [B, 4, h, w]
 
                 # Text embedding
@@ -345,12 +376,12 @@ class MarigoldTrainer:
 
                 # Get the target for loss depending on the prediction type
                 if "sample" == self.prediction_type:
-                    target = gt_depth_latent
+                    target = target_state_latent
                 elif "epsilon" == self.prediction_type:
                     target = noise
                 elif "v_prediction" == self.prediction_type:
                     target = self.training_noise_scheduler.get_velocity(
-                        gt_depth_latent, noise, timesteps
+                        target_state_latent, noise, timesteps
                     )  # [B, 4, h, w]
                 else:
                     raise ValueError(f"Unknown prediction type {self.prediction_type}")
@@ -360,11 +391,18 @@ class MarigoldTrainer:
                 beta_prod_t = 1 - alpha_prod_t
 
                 if "v_prediction" == self.prediction_type:
-                    pred_x0 = (alpha_prod_t ** 0.5) * noisy_latents - (beta_prod_t ** 0.5) * model_pred
+                    pred_state_x0 = (alpha_prod_t ** 0.5) * noisy_latents - (beta_prod_t ** 0.5) * model_pred
                 elif "epsilon" == self.prediction_type:
-                    pred_x0 = (noisy_latents - (beta_prod_t ** 0.5) * model_pred) / (alpha_prod_t ** 0.5)
+                    pred_state_x0 = (noisy_latents - (beta_prod_t ** 0.5) * model_pred) / (alpha_prod_t ** 0.5)
                 else:
-                    pred_x0 = model_pred # sample type
+                    pred_state_x0 = model_pred # sample type
+
+                pred_depth_x0 = compose_depth_latent(
+                    pred_state_x0,
+                    da2_depth_latent,
+                    self.depth_prediction_mode,
+                    self.depth_residual_scale,
+                )
 
             
                 snr = alpha_prod_t / beta_prod_t
@@ -382,13 +420,13 @@ class MarigoldTrainer:
                 if self.gt_mask_type is not None:
                     latent_loss = unreduced_loss[valid_mask_down]
                     grad_loss = self.latent_grad_loss(
-                        pred_x0.float(), 
+                        pred_depth_x0.float(),
                         gt_depth_latent.float(), 
                         valid_mask_down
                     )
                 else:
                     latent_loss = unreduced_loss
-                    grad_loss = self.latent_grad_loss(pred_x0.float(), gt_depth_latent.float())
+                    grad_loss = self.latent_grad_loss(pred_depth_x0.float(), gt_depth_latent.float())
 
                 loss = latent_loss.mean() + 0.1 * grad_loss.mean()
 
@@ -397,7 +435,7 @@ class MarigoldTrainer:
                     # regularizer from changing NYU-style valid indoor regions, while
                     # still giving sky / out-of-range regions a weak geometric target.
                     vgc_loss = self._validity_guided_completion_loss(
-                        pred_x0=pred_x0.float(),
+                        pred_x0=pred_depth_x0.float(),
                         prior_latent=da2_depth_latent.float().detach(),
                         invalid_mask=invalid_mask_down,
                     )
@@ -745,6 +783,11 @@ class MarigoldTrainer:
         unet_path = os.path.join(ckpt_dir, "unet")
         self.model.unet.save_pretrained(unet_path, safe_serialization=False)
         logging.info(f"UNet is saved to: {unet_path}")
+        save_parameterization(
+            os.path.join(ckpt_dir, "depth_parameterization.json"),
+            self.depth_prediction_mode,
+            self.depth_residual_scale,
+        )
 
         if save_train_state:
             state = {
@@ -775,6 +818,17 @@ class MarigoldTrainer:
         self, ckpt_path, load_trainer_state=True, resume_lr_scheduler=True
     ):
         logging.info(f"Loading checkpoint from: {ckpt_path}")
+        saved_mode, saved_scale = load_parameterization(
+            os.path.join(ckpt_path, "depth_parameterization.json")
+        )
+        if (saved_mode, saved_scale) != (
+            self.depth_prediction_mode, self.depth_residual_scale
+        ):
+            raise ValueError(
+                "Checkpoint depth parameterization does not match this run: "
+                f"saved={(saved_mode, saved_scale)}, "
+                f"configured={(self.depth_prediction_mode, self.depth_residual_scale)}"
+            )
         # Load UNet
         _model_path = os.path.join(ckpt_path, "unet", "diffusion_pytorch_model.bin")
         self.model.unet.load_state_dict(
