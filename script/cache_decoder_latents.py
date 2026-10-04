@@ -21,9 +21,10 @@ def main():
     import torch
     import torch.nn.functional as F
     from PIL import Image
-    from diffusers import DDIMScheduler, UNet2DConditionModel
+    from diffusers import DDIMScheduler
     from marigold import MarigoldPipeline
     from src.util.decoder_calibration import read_manifest, read_labels, capture_terminal_prediction
+    from src.util.model_overrides import apply_model_overrides
 
     rows = read_manifest(args.manifest)
     # Validate labels before loading expensive models or generating the cache.
@@ -33,7 +34,7 @@ def main():
     destination = Path(args.output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=False)
     pipe = MarigoldPipeline.from_pretrained(args.base_checkpoint, torch_dtype=torch.float32)
-    pipe.unet = UNet2DConditionModel.from_pretrained(Path(args.unet_checkpoint) / "unet")
+    apply_model_overrides(pipe, args.unet_checkpoint)
     if pipe.unet.config.in_channels != 12 or not isinstance(pipe.scheduler, DDIMScheduler):
         raise ValueError("Use original 12-channel VGC with a DDIM scheduler")
     pipe.to(args.device)

@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 import torch
 from torch import nn
-from diffusers import AutoencoderKL, DDIMScheduler
+from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 
 from src.util.decoder_calibration import (
     calibration_loss, capture_terminal_prediction, decode_raw, eligible_checkpoint,
@@ -150,6 +150,38 @@ class CacheCaptureTest(unittest.TestCase):
 
 
 class DecoderTrainingTest(unittest.TestCase):
+    def test_unet_override_restores_matching_scheduler(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unet = UNet2DConditionModel(
+                sample_size=8, in_channels=12, out_channels=4,
+                layers_per_block=1, block_out_channels=(8,),
+                down_block_types=("CrossAttnDownBlock2D",),
+                up_block_types=("CrossAttnUpBlock2D",),
+                cross_attention_dim=8, attention_head_dim=4,
+                norm_num_groups=4,
+            )
+            unet.save_pretrained(root / "unet", safe_serialization=False)
+            scheduler = DDIMScheduler(
+                num_train_timesteps=100,
+                prediction_type="v_prediction",
+                rescale_betas_zero_snr=True,
+                timestep_spacing="trailing",
+                clip_sample=False,
+            )
+            scheduler.save_pretrained(root / "scheduler")
+            pipe = type("Pipe", (), {})()
+            pipe.unet = unet
+            pipe.scheduler = DDIMScheduler(num_train_timesteps=100)
+            pipe.vae = nn.Identity()
+            pipe.da2 = None
+            apply_model_overrides(pipe, unet_checkpoint=root)
+            self.assertEqual(pipe.scheduler.config.prediction_type, "v_prediction")
+            self.assertTrue(pipe.scheduler.config.rescale_betas_zero_snr)
+            self.assertEqual(pipe.scheduler.config.timestep_spacing, "trailing")
+            pipe.scheduler.set_timesteps(10)
+            self.assertEqual(pipe.scheduler.timesteps[0].item(), 99)
+
     def test_only_decoder_changes_and_inference_load_preserves_encoder(self):
         torch.manual_seed(9)
         source = tiny_vae()

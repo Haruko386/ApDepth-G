@@ -5,7 +5,7 @@ import torch
 
 
 def apply_model_overrides(pipe, unet_checkpoint=None, decoder_checkpoint=None):
-    from diffusers import AutoencoderKL, UNet2DConditionModel
+    from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 
     if unet_checkpoint:
         path = Path(unet_checkpoint)
@@ -13,6 +13,15 @@ def apply_model_overrides(pipe, unet_checkpoint=None, decoder_checkpoint=None):
         if unet.config.in_channels != 12:
             raise ValueError("Expected a trained 12-channel VGC U-Net")
         pipe.unet = unet
+        scheduler_path = path / "scheduler"
+        if scheduler_path.is_dir():
+            pipe.scheduler = DDIMScheduler.from_pretrained(scheduler_path)
+            if pipe.scheduler.config.prediction_type != "v_prediction":
+                raise ValueError("Aligned checkpoint scheduler must use v_prediction")
+            if not pipe.scheduler.config.rescale_betas_zero_snr:
+                raise ValueError("Aligned checkpoint scheduler must use zero terminal SNR")
+            if pipe.scheduler.config.timestep_spacing != "trailing":
+                raise ValueError("Aligned checkpoint scheduler must use trailing timesteps")
     if decoder_checkpoint:
         if pipe.unet.config.in_channels != 12:
             raise ValueError("Load original VGC U-Net before its calibrated decoder")

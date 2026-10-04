@@ -1,7 +1,11 @@
 # ApDepth-G：VGC 之后的天空塌陷修复尝试记录
 
+> 2026-10-04 更新：第 14 节记录 `residual_snr` 主训练失败。用户实测天空比原方案更差，
+> 城市场景中天空被预测为近处，并与远处山体/树林形成明显反向层次。该补全项已从主训练移除。
+> 新实验转向扩散端点分布对齐，不再增加天空或 invalid region 监督，见 `doc/terminal_snr_alignment.md`。
+
 > 2026-10-01 后续决定：保留 decoder calibration 后训练，尚未收到本方案失败反馈。
-> 同时新增从 SD2 初始化的主 U-Net 实验：噪声感知的先验残差补全，见 `doc/unet_residual_completion.md`。
+> 当时新增的噪声感知先验残差补全后来已失败，见第 14 节。
 > 用户反馈目前 VGC U-Net 的天空塌陷更严重，因此原 VGC 不再视为已验证解决方案；
 > 以下“相对有效”等表述保留为历史记录，新主训练效果同样待验证。
 
@@ -1074,6 +1078,7 @@ Status: RUNNING / UNVERIFIED
 | 方法 | 核心想法 | 结果 / 当前状态 |
 |---|---|---|
 | **VGC** | invalid region weak DA2 anchor + smoothness | **保留；目前最后一个相对有效的方案** |
+| **residual_snr** | invalid region 的 DA2 残差均值与带符号梯度、按 SNR 加权 | **用户实测天空更差且远近反向；已移除，见第 14 节** |
 | **AFG** | ambiguity-aware far-field geometry | **失败，NYU 严重退化，移除** |
 | **HFP** | horizon / upper-image far prior | **基本无效果，移除** |
 | **SFO** | sky–foreground ordinal ranking | **无明显收益，移除** |
@@ -1341,3 +1346,44 @@ DA2 的语义相似也不等价于同一深度；全图约束可能与原有几�
 只让深度解码器学习明确语义天空标签的像素远端约束，并保留非天空输出。
 与 §11 的 >=80m latent 主监督、§12 的 GT 加噪短轨迹后训练不同；也不把天空 mask 加进推理输入。
 这是一项新的待验证实验，不预先认定有效。若冻结 latent 无法区分天空和物体，解码器校准也可能失败。
+
+---
+
+# 14. `residual_snr` 先验残差补全（2026-10-04：天空更差 / 移除）
+
+## 方案
+
+该方案从 SD2 重新训练主 U-Net，在原 VGC 位置改为噪声感知的先验残差补全：
+
+- 令 `r = pred_x0 - stop_grad(z_DA2)`；
+- 在完全无效的 latent cell 内约束 `r` 的区域均值；
+- 约束 `r` 的带符号水平/垂直梯度，试图阻止 DA2 远近方向被翻转；
+- 用 `min(SNR, 5) / 5` 衰减高噪声时间步的补全项；
+- 保留 12 通道、DA2、原主扩散损失、Min-SNR、latent gradient 和 50 步 DDIM。
+
+实现时同时修正了不同 prediction type 的 Min-SNR 换算以及有效边界梯度掩码。
+这些通用修正本身没有独立真实训练消融，不能把本次失败归因于其中任意一项。
+
+## 用户反馈与可观察现象
+
+用户明确反馈：`residual_snr` 的天空效果反而更差。提供的城市道路结果中，按项目 Spectral
+色图方向观察，顶部大面积天空呈红/洋红近端颜色，远处山体和树林却呈蓝/绿色，形成明显的
+天空—地平线远近反向；天空边界还有一圈强烈的黄/绿色过渡。这与“天空保持稳定远端”的目标相反。
+
+当前没有该结果对应的精确 checkpoint 步数、相同 seed 的 VGC 基线、浮点深度或数据集指标，
+因此这里只记录定性失败，不虚构退化幅度，也不把单张图推断成所有场景都会反转。
+
+**状态：FAILED / REMOVED。** 删除残差补全 loss、配置开关、专项测试和原实验说明；
+主训练恢复原 VGC 的弱区域均值锚点与 invalid-region smoothness。
+
+## 与此前失败方案合并后的判断
+
+已知远端主监督、显式天空 infinity、语义关系和本次 residual 补全虽然目标不同，但共同现象是：
+越直接地把额外目标压到天空、far-field 或 invalid region，越容易出现斑点、错误坡度或远近反向。
+目前证据更支持停止追加天空监督，而不是继续更换 mask、teacher 或辅助 loss 的形式。
+
+可能原因仍只是待验证解释：invalid 不等于天空；DA2 在天空/低纹理区不是可靠 GT；VAE latent
+的局部均值与梯度不直接等于解码像素的绝对远近；辅助目标还会通过共享 U-Net 改变整个场景。
+
+下一轮因此只改扩散训练与多步采样的端点一致性，不新增任何 sky mask、远端伪标签、GT 有效域
+或 invalid-region loss。具体候选见 `doc/terminal_snr_alignment.md`，仍属于未验证实验。

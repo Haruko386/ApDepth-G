@@ -49,8 +49,9 @@ from src.util.metric import MetricTracker
 from src.util.multi_res_noise import multi_res_noise_like
 from src.util.alignment import align_depth_least_square
 from src.util.seeding import generate_seed_sequence
-from src.util.residual_completion import (
-    latent_validity_masks, min_snr_weights, residual_completion_loss,
+from src.util.diffusion_training import (
+    align_inference_scheduler, align_training_scheduler,
+    latent_validity_masks, min_snr_weight, terminal_noise_fade,
 )
 
 
@@ -127,21 +128,28 @@ class MarigoldTrainer:
         self.vgc_anchor_weight = float(vgc_cfg.get("anchor_weight", 0.02))
         self.vgc_smooth_weight = float(vgc_cfg.get("smooth_weight", 0.005))
         self.vgc_eps = float(vgc_cfg.get("eps", 1e-6))
-        self.vgc_mode = vgc_cfg.get("mode", "legacy")
-        if self.vgc_mode not in ("legacy", "residual_snr"):
-            raise ValueError(f"Unknown completion mode: {self.vgc_mode}")
-        self.vgc_gradient_weight = float(vgc_cfg.get("gradient_weight", 0.005))
         self.min_snr_gamma = float(self.cfg.get("min_snr_gamma", 5.0))
         if self.min_snr_gamma <= 0:
             raise ValueError("min_snr_gamma must be positive")
+        schedule_cfg = self.cfg.get("diffusion_schedule", {})
+        self.min_snr_floor = float(schedule_cfg.get("min_snr_floor", 0.0))
+        self.terminal_noise_fade_fraction = float(
+            schedule_cfg.get("terminal_noise_fade_fraction", 0.1)
+        )
 
         # Training noise scheduler
-        self.training_noise_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
+        base_training_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
             os.path.join(
                 base_ckpt_dir,
                 cfg.trainer.training_noise_scheduler.pretrained_path,
                 "scheduler",
             )
+        )
+        self.training_noise_scheduler = align_training_scheduler(
+            base_training_scheduler, schedule_cfg
+        )
+        self.model.scheduler = align_inference_scheduler(
+            self.model.scheduler, schedule_cfg
         )
         self.prediction_type = self.training_noise_scheduler.config.prediction_type
         assert (
@@ -155,8 +163,6 @@ class MarigoldTrainer:
         self.metric_funcs = [getattr(metric, _met) for _met in cfg.eval.eval_metrics]
         self.train_metrics = MetricTracker(
             "loss", "diffusion_loss", "latent_gradient_loss", "completion_loss",
-            "completion_anchor", "completion_gradient", "completion_coverage",
-            "completion_snr_weight",
         )
         self.val_metrics = MetricTracker(*[m.__name__ for m in self.metric_funcs])
         # main metric for best checkpoint saving
@@ -259,7 +265,7 @@ class MarigoldTrainer:
 
                 if self.gt_mask_type is not None:
                     valid_mask_for_latent = batch[self.gt_mask_type].to(device)
-                    valid_mask_down, invalid_interior_down = latent_validity_masks(
+                    valid_mask_down, _ = latent_validity_masks(
                         valid_mask_for_latent
                     )
                     valid_mask_down = valid_mask_down.repeat((1, 4, 1, 1))
@@ -287,11 +293,19 @@ class MarigoldTrainer:
                     device=device,
                     generator=rand_num_generator,
                 ).long()  # [B]
+                terminal_fade = terminal_noise_fade(
+                    timesteps,
+                    self.scheduler_timesteps,
+                    self.terminal_noise_fade_fraction,
+                )
 
                 if self.apply_multi_res_noise:
                     strength = self.mr_noise_strength
                     if self.annealed_mr_noise:
-                        strength = strength * (timesteps / self.scheduler_timesteps)
+                        strength = strength * (
+                            timesteps / max(self.scheduler_timesteps - 1, 1)
+                        )
+                    strength = strength * terminal_fade
                     noise = multi_res_noise_like(
                         gt_depth_latent,
                         strength=strength,
@@ -305,13 +319,24 @@ class MarigoldTrainer:
                         device=device,
                         generator=rand_num_generator,
                     )  # [B, 4, h, w]
+
+                # Multi-resolution noise is not a standard Gaussian at the last
+                # timestep. Match inference exactly at the pure-noise endpoint.
+                terminal = (timesteps == self.scheduler_timesteps - 1).view(-1, 1, 1, 1)
+                if self.apply_multi_res_noise and terminal.any():
+                    standard_noise = torch.randn(
+                        gt_depth_latent.shape,
+                        device=device,
+                        generator=rand_num_generator,
+                    )
+                    noise = torch.where(terminal, standard_noise, noise)
                 
                 offset_noise_strength = 0.1
                 offset_noise = torch.randn(
                     batch_size, gt_depth_latent.shape[1], 1, 1, 
                     device=device, 
                     generator=rand_num_generator
-                ) * offset_noise_strength
+                ) * offset_noise_strength * terminal_fade.view(-1, 1, 1, 1)
                 noise = noise + offset_noise
 
                 # Add noise to the latents (diffusion forward process)
@@ -362,8 +387,11 @@ class MarigoldTrainer:
                     pred_x0 = model_pred # sample type
 
             
-                snr_weight, completion_snr_weight = min_snr_weights(
-                    alpha_prod_t, self.prediction_type, self.min_snr_gamma
+                snr_weight = min_snr_weight(
+                    alpha_prod_t,
+                    self.prediction_type,
+                    self.min_snr_gamma,
+                    self.min_snr_floor,
                 )
 
                 diff = model_pred.float() - target.float()
@@ -387,18 +415,8 @@ class MarigoldTrainer:
 
                 loss = latent_loss.mean() + 0.1 * grad_loss.mean()
                 vgc_loss = loss.new_zeros(())
-                completion_stats = {}
 
-                if self.vgc_enabled and self.vgc_mode == "residual_snr":
-                    vgc_loss, completion_stats = residual_completion_loss(
-                        pred_x0, da2_depth_latent, invalid_interior_down,
-                        completion_snr_weight,
-                        anchor_weight=self.vgc_anchor_weight,
-                        gradient_weight=self.vgc_gradient_weight,
-                        min_invalid_ratio=self.vgc_min_invalid_ratio,
-                    )
-                    loss = loss + vgc_loss
-                elif self.vgc_enabled:
+                if self.vgc_enabled:
                     # VGC only supervises invalid-depth regions. This prevents the
                     # regularizer from directly supervising valid pixels. Shared
                     # U-Net parameters still require indoor regression evaluation.
@@ -413,8 +431,6 @@ class MarigoldTrainer:
                 self.train_metrics.update("diffusion_loss", latent_loss.mean().item())
                 self.train_metrics.update("latent_gradient_loss", grad_loss.mean().item())
                 self.train_metrics.update("completion_loss", vgc_loss.item())
-                for name, value in completion_stats.items():
-                    self.train_metrics.update(name, value.item())
 
                 loss = loss / self.gradient_accumulation_steps
                 loss.backward()
@@ -756,6 +772,12 @@ class MarigoldTrainer:
         unet_path = os.path.join(ckpt_dir, "unet")
         self.model.unet.save_pretrained(unet_path, safe_serialization=False)
         logging.info(f"UNet is saved to: {unet_path}")
+
+        # Inference must use the same prediction type, terminal SNR and timestep
+        # spacing as training. Store the DDIM scheduler beside every U-Net.
+        scheduler_path = os.path.join(ckpt_dir, "scheduler")
+        self.model.scheduler.save_pretrained(scheduler_path)
+        logging.info(f"Inference scheduler is saved to: {scheduler_path}")
 
         if save_train_state:
             state = {

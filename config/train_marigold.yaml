@@ -68,12 +68,21 @@ loss:
 
 min_snr_gamma: 5.0
 
+# Align the highest-noise training state with pure-noise DDIM inference.
+# v-prediction keeps x0 reconstruction finite at exactly zero terminal SNR;
+# the small floor prevents Min-SNR from discarding that endpoint entirely.
+diffusion_schedule:
+  prediction_type: v_prediction
+  rescale_betas_zero_snr: true
+  timestep_spacing: trailing
+  min_snr_floor: 0.05
+  terminal_noise_fade_fraction: 0.10
+
 validity_guided_completion:
   enabled: true
-  mode: residual_snr  # training-only noise-aware residual completion
   min_invalid_ratio: 0.08
   anchor_weight: 0.02
-  gradient_weight: 0.005  # squared signed gradient of (prediction - prior)
+  smooth_weight: 0.005
   eps: 1.0e-6
 
 lr: 3.0e-05
