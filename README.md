@@ -16,6 +16,15 @@ This repository is based on [Marigold](https://marigoldmonodepth.github.io), CVP
 >
 > This project follows the same training methodology as [**ApDepth**](https://github.com/cvrs-ys801/ApDepth) and serves as an extension of its content. It is provided for reference only.
 
+> [!IMPORTANT]
+>
+> The active experiment on the `nightly` branch uses **SDXL Base 1.0** and retains
+> multi-step DDIM depth inference. It trains a 12-channel U-Net conditioned on RGB,
+> a frozen DA2-Giant prior, and noisy depth. The default completion objective is the
+> newer `residual_snr` mode; the original VGC implementation remains available as
+> `legacy`, but the two modes are not applied together. Decoder calibration is a
+> separate optional post-training workflow and is not run by the SDXL training config.
+
 ## 🛠️ Setup
 
 The model was trained on:
@@ -39,18 +48,29 @@ We recommend running the code in WSL2:
 Clone the repository (requires git):
 
 ```bash
-git clone https://github.com/cvrs-ys801/ApDepth-G.git
+git clone https://github.com/Haruko386/ApDepth-G.git
 cd ApDepth-G
+git switch --track origin/nightly
 ```
 
 ### 💻 Dependencies
 
- **Using Conda:** 
-    Alternatively, create a Python native virtual environment and install dependencies into it:
+**Using Conda:** create an environment and install the base dependencies:
 
-    conda create -n apdepth python==3.12.9
-    conda activate apdepth
-    pip install -r requirements.txt
+```bash
+conda create -n apdepth python==3.12.9
+conda activate apdepth
+pip install -r requirements.txt
+```
+
+For the SDXL experiment, install its additional dependencies without replacing the
+CUDA-enabled PyTorch installation:
+
+```bash
+python -m pip install -r requirements-sdxl.txt
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_bf16_supported())"
+python -m bitsandbytes
+```
 
 Keep the environment activated before running the inference script. 
 Activate the environment again after restarting the terminal session.
@@ -162,25 +182,112 @@ export BASE_DATA_DIR=YOUR_DATA_DIR  # directory of training data
 export BASE_CKPT_DIR=YOUR_CHECKPOINT_DIR  # directory of pretrained checkpoint
 ```
 
-Download Stable Diffusion v2 [checkpoint](https://huggingface.co/stabilityai/stable-diffusion-2) into `${BASE_CKPT_DIR}`
+Download [SDXL Base 1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0)
+into `${BASE_CKPT_DIR}/stable-diffusion-xl-base-1.0`. The refiner and duplicate
+single-file checkpoints are not used:
+
+```bash
+python - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+
+base_dir = os.environ["BASE_CKPT_DIR"]
+snapshot_download(
+    "stabilityai/stable-diffusion-xl-base-1.0",
+    local_dir=os.path.join(base_dir, "stable-diffusion-xl-base-1.0"),
+    allow_patterns=[
+        "model_index.json",
+        "*/config.json",
+        "scheduler/*",
+        "tokenizer/*",
+        "tokenizer_2/*",
+        "unet/diffusion_pytorch_model.safetensors",
+        "vae/diffusion_pytorch_model.safetensors",
+        "text_encoder/model.safetensors",
+        "text_encoder_2/model.safetensors",
+    ],
+)
+PY
+```
+
+The project also expects the existing DA2-Giant checkpoint at
+`DA2/checkpoints/depth_anything_v2_vitg.pth`.
+
+The SDXL main-training stack enabled by `config/train_sdxl_demo.yaml` is:
+
+- 12-channel RGB + DA2 prior + noisy-depth conditioning;
+- annealed multi-resolution noise and channel-wise offset noise;
+- prediction-type-correct Min-SNR weighting and valid-region latent-gradient loss;
+- `residual_snr` invalid-region completion, with original VGC retained only as the
+  selectable `legacy` mode.
+
+Removed failed experiments are not re-enabled. Decoder calibration remains in the
+repository as an independent post-training experiment and is not invoked here.
 
 Prepare for [Hypersim](https://github.com/apple/ml-hypersim) and [Virtual KITTI 2](https://europe.naverlabs.com/research/computer-vision/proxy-virtual-worlds-vkitti-2/) datasets and save into `${BASE_DATA_DIR}`. Please refer to [this README](script/dataset_preprocess/hypersim/README.md) for Hypersim preprocessing.
 
-Run training script
+Before a full run, stop other GPU jobs and run the two-update memory probe. It uses
+one real HyperSim and one real Virtual KITTI sample per optimizer update, allocates
+the 8-bit Adam state, and writes the measured CUDA usage to
+`output/sdxl_probe_v1/train_sdxl_probe/memory_profile.json`:
 
 ```bash
-python train.py --config config/train_marigold.yaml --no_wandb
+python train.py \
+    --config config/train_sdxl_probe.yaml \
+    --base_data_dir "${BASE_DATA_DIR}" \
+    --base_ckpt_dir "${BASE_CKPT_DIR}" \
+    --output_dir output/sdxl_probe_v1 \
+    --no_wandb
 ```
 
-Resume from a checkpoint, e.g.
+Only start the full 23,000-update run after the probe finishes at
+`effective_iter: 2` with safe VRAM headroom:
 
 ```bash
-python train.py --resume_run output/train_marigold/checkpoint/latest --no_wandb
+python train.py \
+    --config config/train_sdxl_demo.yaml \
+    --base_data_dir "${BASE_DATA_DIR}" \
+    --base_ckpt_dir "${BASE_CKPT_DIR}" \
+    --output_dir output/sdxl_demo_v1 \
+    --no_wandb
 ```
 
-Evaluating results
+The SDXL config trains the full U-Net with microbatch 1, gradient accumulation 42,
+BF16 autocast, activation checkpointing, and 8-bit Adam. It keeps FP32 master
+weights and computes the losses in FP32. See [the SDXL demo notes](doc/sdxl_demo.md)
+for the measured-vs-estimated memory distinction and current validation scope.
 
-Only the U-Net is updated and saved during training. To use the inference pipeline with your training result, replace `unet` folder in Marigold checkpoints with that in the `checkpoint` output folder. Then refer to [this section](#evaluation) for evaluation.
+Resume from the matching SDXL run directory:
+
+```bash
+python train.py \
+    --resume_run output/sdxl_demo_v1/train_sdxl_demo/checkpoint/latest \
+    --base_data_dir "${BASE_DATA_DIR}" \
+    --base_ckpt_dir "${BASE_CKPT_DIR}" \
+    --no_wandb
+```
+
+Run 50-step inference with the trained U-Net. The base SDXL checkpoint alone is not
+a depth estimator and must not be used without `--unet_checkpoint`:
+
+```bash
+python run.py \
+    --backbone sdxl \
+    --checkpoint "${BASE_CKPT_DIR}/stable-diffusion-xl-base-1.0" \
+    --unet_checkpoint output/sdxl_demo_v1/train_sdxl_demo/checkpoint/iter_023000 \
+    --input_rgb_dir input/in-the-wild_example \
+    --output_dir output/sdxl_demo_eval \
+    --denoise_steps 50 \
+    --ensemble_size 1 \
+    --batch_size 1 \
+    --processing_res 768 \
+    --seed 2024
+```
+
+Only the U-Net is updated by this training command. The repository still contains
+the optional decoder-calibration workflow, but it is not part of the command above.
+If it is used later, its full multi-step latent cache must be regenerated from the
+selected SDXL U-Net; SD2 caches and calibrated decoders are incompatible with SDXL.
 
 > [!IMPORTANT]
 >
