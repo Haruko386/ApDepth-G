@@ -49,10 +49,16 @@ diffusion_schedule:
   prediction_type: v_prediction
   rescale_betas_zero_snr: true
   timestep_spacing: trailing
+  min_snr_gamma: 5.0
+  endpoint_weight_floor: 0.05
+  terminal_noise_fade_fraction: 0.10
 
-# Standard Gaussian noise now matches the actual DDIM inference start exactly.
-# Multi-resolution and offset noise are intentionally disabled in this branch.
-multi_res_noise: null
+multi_res_noise:
+  strength: 0.9
+  annealed: true
+  downscale_strategy: original
+
+offset_noise_strength: 0.1
 
 gt_depth_type: depth_raw_norm
 gt_mask_type: valid_mask_raw
@@ -75,12 +81,12 @@ depth_parameterization:
   mode: prior_residual
   residual_scale: 1.0
 
-# Only uncontaminated valid latent cells receive supervision. Invalid pixels are
-# filled with DA2 before VAE encoding, but remain excluded from every loss.
-masked_latent_training:
+# VGC no longer adds a loss on invalid regions. It completes invalid encoder
+# input with the frozen prior and censors boundary-contaminated latent cells.
+validity_guided_completion:
+  enabled: true
+  mode: target_censoring
   boundary_margin: 2
-  min_snr_gamma: 5.0
-  endpoint_weight_floor: 0.05
 
 lr: 3.0e-05
 lr_scheduler:

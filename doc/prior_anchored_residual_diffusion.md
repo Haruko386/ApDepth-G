@@ -2,16 +2,18 @@
 
 日期：2026-10-04。状态：实现完成，尚未进行真实 SD2 + DA2-Giant 训练，不能提前宣称已解决天空塌陷。
 
-## 为什么不再保留 VGC
+## VGC 的改动
 
 VGC 把无效深度区域近似成天空/远场，并在该区域施加 DA2 区域均值锚点和平滑损失。此前多个失败实验都出现了相同规律：对 sky、far-field 或 invalid region 增加直接监督后，天空更容易出现斑点、错误坡度或远近反转。
 
-`invalid depth` 还包括越界深度、遮挡、传感器空洞等内容，并不等价于天空。为避免继续重复这个问题，master 实验完全删除 VGC：
+`invalid depth` 还包括越界深度、遮挡、传感器空洞等内容，并不等价于天空。因此本实验保留 validity-guided 的思想，但把 VGC 从额外监督改成 `target_censoring`：
 
 - 不计算 invalid-region anchor；
 - 不计算 invalid-region smoothness；
 - 不使用 sky mask 或天空伪标签；
 - 不扩大有效 GT 范围。
+
+VGC 现在只负责在 VAE 编码前清理无效深度值，并隔离可能受无效值污染的边界 latent，不再要求 U-Net 在无效区域拟合某个伪目标。
 
 ## 新的扩散变量
 
@@ -48,17 +50,18 @@ d_encode = valid * d_gt + (1 - valid) * stop_grad(d_DA2)
 - checkpoint 必须包含 `scheduler/`，推理缺失时直接报错；
 - Min-SNR 使用 v-prediction 对应权重，纯噪声端点保留 `0.05` 权重。
 
-## 删除结构化噪声
+## 原有训练项的保留与适配
 
-Multi-resolution noise 和 channel-wise offset noise 已关闭。此前训练使用结构化噪声，而多步推理从标准高斯开始，两个分布并不一致。zero-terminal-SNR 已经负责训练纯噪声端点，因此本实验使用标准高斯贯穿训练和推理。
+Multi-resolution noise、channel-wise offset noise 和 latent gradient loss 均保留。为适配 zero-terminal-SNR，前两种结构化噪声在最后 10% timestep 逐渐衰减，并在最后一个 timestep 完全切换成标准高斯，使多步推理起点与训练端点一致。
 
-Latent gradient loss 也已删除。VAE 四通道特征的梯度不等价于像素深度梯度，它会额外强调高频和边界，目前没有证据表明这对天空有益。
+Latent gradient loss 仍只作用于有效区域；其边掩码改为要求梯度两端都有效，避免跨越天空/无效区边界计算梯度。
 
 ## 保留内容
 
 - SD2 与冻结的 DA2-Giant；
 - 12 通道 `[RGB latent, DA2 latent, noisy residual latent]`；
-- 有效 GT 上唯一的 Min-SNR v-prediction MSE；
+- 有效 GT 上的 Min-SNR v-prediction MSE；
+- multi-resolution noise、offset noise 和有效区域 latent gradient；
 - 23,000 optimizer steps；
 - 50 步 DDIM 推理。
 

@@ -24,6 +24,16 @@ def min_snr_v_weight(alpha_bar, gamma=5.0, endpoint_floor=0.05):
     return bounded_snr / (snr + 1.0)
 
 
+def terminal_noise_fade(timesteps, num_train_timesteps, fade_fraction=0.1):
+    """Fade structured noise augmentation near the pure-noise endpoint."""
+    if num_train_timesteps < 2:
+        raise ValueError("At least two training timesteps are required")
+    if not 0 < fade_fraction <= 1:
+        raise ValueError("fade_fraction must be in (0, 1]")
+    progress = timesteps.float() / float(num_train_timesteps - 1)
+    return ((1.0 - progress) / fade_fraction).clamp(0.0, 1.0)
+
+
 def make_v_prediction_schedulers(
     base_training_scheduler, base_inference_scheduler, config=None
 ):

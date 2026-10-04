@@ -18,7 +18,7 @@ from src.util.prior_residual import (
 from src.util.model_overrides import load_unet_checkpoint
 from src.util.diffusion_training import (
     conservative_latent_valid_mask, fill_invalid_depth_with_prior,
-    make_v_prediction_schedulers, min_snr_v_weight,
+    make_v_prediction_schedulers, min_snr_v_weight, terminal_noise_fade,
 )
 
 
@@ -46,9 +46,10 @@ class PriorResidualTest(unittest.TestCase):
         cfg = recursive_load_config("config/train_marigold.yaml")
         self.assertEqual(cfg.depth_parameterization.mode, PRIOR_RESIDUAL)
         self.assertEqual(cfg.depth_parameterization.residual_scale, 1.0)
-        self.assertNotIn("validity_guided_completion", cfg)
-        self.assertIsNone(cfg.multi_res_noise)
-        self.assertEqual(cfg.masked_latent_training.boundary_margin, 2)
+        self.assertTrue(cfg.validity_guided_completion.enabled)
+        self.assertEqual(cfg.validity_guided_completion.mode, "target_censoring")
+        self.assertEqual(cfg.validity_guided_completion.boundary_margin, 2)
+        self.assertEqual(cfg.multi_res_noise.strength, 0.9)
         self.assertEqual(cfg.diffusion_schedule.prediction_type, "v_prediction")
         self.assertTrue(cfg.diffusion_schedule.rescale_betas_zero_snr)
         self.assertEqual(cfg.diffusion_schedule.timestep_spacing, "trailing")
@@ -67,6 +68,10 @@ class PriorResidualTest(unittest.TestCase):
         torch.testing.assert_close(
             endpoint_weight, torch.full_like(endpoint_weight, 0.05)
         )
+        fade = terminal_noise_fade(torch.tensor([0, 949, 999]), 1000, 0.1)
+        self.assertEqual(fade[0].item(), 1.0)
+        self.assertAlmostEqual(fade[1].item(), 0.5005, places=3)
+        self.assertEqual(fade[2].item(), 0.0)
 
         depth = torch.full((1, 1, 16, 24), -1.0)
         valid = torch.ones_like(depth, dtype=torch.bool)
@@ -182,7 +187,7 @@ class PriorResidualTest(unittest.TestCase):
         cfg.max_iter = cfg.max_epoch = 1
         cfg.lr_scheduler.kwargs.warmup_steps = 0
         cfg.trainer.save_period = cfg.trainer.backup_period = 0
-        cfg.masked_latent_training.boundary_margin = 0
+        cfg.validity_guided_completion.boundary_margin = 0
         pipe = Pipeline()
         original = pipe.unet.conv_in.weight.detach().clone()
         valid = torch.ones(1, 1, 32, 32, dtype=torch.bool)

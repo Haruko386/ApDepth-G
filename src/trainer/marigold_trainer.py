@@ -42,17 +42,19 @@ from marigold.marigold_pipeline import MarigoldPipeline, MarigoldDepthOutput
 from src.util import metric
 from src.util.data_loader import skip_first_batches
 from src.util.logging_util import tb_logger, eval_dic_to_text
+from src.util.loss import LatentGradLoss
 from src.util.lr_scheduler import IterExponential
 from src.util.metric import MetricTracker
+from src.util.multi_res_noise import multi_res_noise_like
 from src.util.alignment import align_depth_least_square
 from src.util.seeding import generate_seed_sequence
 from src.util.diffusion_training import (
     V_PREDICTION, conservative_latent_valid_mask,
     fill_invalid_depth_with_prior, make_v_prediction_schedulers,
-    min_snr_v_weight, validate_v_scheduler,
+    min_snr_v_weight, terminal_noise_fade, validate_v_scheduler,
 )
 from src.util.prior_residual import (
-    diffusion_target,
+    compose_depth_latent, diffusion_target,
     load_parameterization, save_parameterization, validate_parameterization,
 )
 
@@ -118,6 +120,7 @@ class MarigoldTrainer:
 
         if self.cfg.loss.name != "mse_loss":
             raise ValueError("v-prediction training requires an MSE diffusion loss")
+        self.latent_grad_loss = LatentGradLoss()
 
         parameterization_cfg = self.cfg.get("depth_parameterization", {})
         self.depth_prediction_mode, self.depth_residual_scale = validate_parameterization(
@@ -128,11 +131,20 @@ class MarigoldTrainer:
             self.depth_prediction_mode, self.depth_residual_scale
         )
 
-        mask_cfg = self.cfg.get("masked_latent_training", {})
-        self.latent_boundary_margin = int(mask_cfg.get("boundary_margin", 2))
-        self.min_snr_gamma = float(mask_cfg.get("min_snr_gamma", 5.0))
+        vgc_cfg = self.cfg.get("validity_guided_completion", {})
+        self.vgc_enabled = bool(vgc_cfg.get("enabled", False))
+        self.vgc_mode = str(vgc_cfg.get("mode", "target_censoring"))
+        if not self.vgc_enabled or self.vgc_mode != "target_censoring":
+            raise ValueError("This experiment requires VGC target_censoring mode")
+        self.latent_boundary_margin = int(vgc_cfg.get("boundary_margin", 2))
+
+        schedule_cfg = self.cfg.get("diffusion_schedule", {})
+        self.min_snr_gamma = float(schedule_cfg.get("min_snr_gamma", 5.0))
         self.endpoint_weight_floor = float(
-            mask_cfg.get("endpoint_weight_floor", 0.05)
+            schedule_cfg.get("endpoint_weight_floor", 0.05)
+        )
+        self.terminal_noise_fade_fraction = float(
+            schedule_cfg.get("terminal_noise_fade_fraction", 0.1)
         )
 
         # Training noise scheduler
@@ -147,7 +159,7 @@ class MarigoldTrainer:
             make_v_prediction_schedulers(
                 base_training_scheduler,
                 self.model.scheduler,
-                self.cfg.get("diffusion_schedule", {}),
+                schedule_cfg,
             )
         )
         validate_v_scheduler(self.training_noise_scheduler)
@@ -159,7 +171,9 @@ class MarigoldTrainer:
 
         # Eval metrics
         self.metric_funcs = [getattr(metric, _met) for _met in cfg.eval.eval_metrics]
-        self.train_metrics = MetricTracker("loss", "diffusion_loss")
+        self.train_metrics = MetricTracker(
+            "loss", "diffusion_loss", "latent_gradient_loss"
+        )
         self.val_metrics = MetricTracker(*[m.__name__ for m in self.metric_funcs])
         # main metric for best checkpoint saving
         self.main_val_metric = cfg.validation.main_val_metric
@@ -180,11 +194,14 @@ class MarigoldTrainer:
         self.val_period = self.cfg.trainer.validation_period
         self.vis_period = self.cfg.trainer.visualization_period
 
-        if self.cfg.get("multi_res_noise") is not None:
-            raise ValueError(
-                "This experiment requires standard Gaussian noise; "
-                "set multi_res_noise to null."
+        self.apply_multi_res_noise = self.cfg.multi_res_noise is not None
+        if self.apply_multi_res_noise:
+            self.mr_noise_strength = self.cfg.multi_res_noise.strength
+            self.annealed_mr_noise = self.cfg.multi_res_noise.annealed
+            self.mr_noise_downscale_strategy = (
+                self.cfg.multi_res_noise.downscale_strategy
             )
+        self.offset_noise_strength = float(self.cfg.get("offset_noise_strength", 0.1))
 
         # Internal variables
         self.epoch = 1
@@ -329,13 +346,56 @@ class MarigoldTrainer:
                     generator=rand_num_generator,
                 ).long()  # [B]
 
-                # Match inference exactly: the terminal state is standard Gaussian.
-                # Structured and channel-wise offset noise are intentionally absent.
-                noise = torch.randn(
-                    target_state_latent.shape,
+                terminal_fade = terminal_noise_fade(
+                    timesteps,
+                    self.scheduler_timesteps,
+                    self.terminal_noise_fade_fraction,
+                )
+                if self.apply_multi_res_noise:
+                    strength = self.mr_noise_strength
+                    if self.annealed_mr_noise:
+                        strength = strength * (
+                            timesteps / max(self.scheduler_timesteps - 1, 1)
+                        )
+                    strength = strength * terminal_fade
+                    noise = multi_res_noise_like(
+                        target_state_latent,
+                        strength=strength,
+                        downscale_strategy=self.mr_noise_downscale_strategy,
+                        generator=rand_num_generator,
+                        device=device,
+                    )
+                else:
+                    noise = torch.randn(
+                        target_state_latent.shape,
+                        device=device,
+                        generator=rand_num_generator,
+                    )
+
+                terminal = (timesteps == self.scheduler_timesteps - 1).view(
+                    -1, 1, 1, 1
+                )
+                if terminal.any():
+                    standard_noise = torch.randn(
+                        target_state_latent.shape,
+                        device=device,
+                        generator=rand_num_generator,
+                    )
+                    noise = torch.where(terminal, standard_noise, noise)
+
+                offset_noise = torch.randn(
+                    batch_size,
+                    target_state_latent.shape[1],
+                    1,
+                    1,
                     device=device,
                     generator=rand_num_generator,
-                )  # [B, 4, h, w]
+                )
+                noise = noise + (
+                    offset_noise
+                    * self.offset_noise_strength
+                    * terminal_fade.view(-1, 1, 1, 1)
+                )
 
                 # Add noise to the latents (diffusion forward process)
                 noisy_latents = self.training_noise_scheduler.add_noise(
@@ -367,6 +427,17 @@ class MarigoldTrainer:
                 
                 alphas_cumprod = self.training_noise_scheduler.alphas_cumprod.to(device)
                 alpha_prod_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+                beta_prod_t = 1.0 - alpha_prod_t
+                pred_state_x0 = (
+                    alpha_prod_t.sqrt() * noisy_latents
+                    - beta_prod_t.sqrt() * model_pred
+                )
+                pred_depth_x0 = compose_depth_latent(
+                    pred_state_x0,
+                    da2_depth_latent,
+                    self.depth_prediction_mode,
+                    self.depth_residual_scale,
+                )
                 snr_weight = min_snr_v_weight(
                     alpha_prod_t,
                     gamma=self.min_snr_gamma,
@@ -381,13 +452,22 @@ class MarigoldTrainer:
                     latent_loss = torch.where(
                         valid_mask_down, unreduced_loss, 0.0
                     ).sum() / valid_mask_down.sum().clamp_min(1)
+                    grad_loss = self.latent_grad_loss(
+                        pred_depth_x0.float(),
+                        gt_depth_latent.float(),
+                        valid_mask_down,
+                    )
                 else:
                     latent_loss = unreduced_loss
+                    grad_loss = self.latent_grad_loss(
+                        pred_depth_x0.float(), gt_depth_latent.float()
+                    )
 
-                loss = latent_loss.mean()
+                loss = latent_loss.mean() + 0.1 * grad_loss.mean()
 
                 self.train_metrics.update("loss", loss.item())
                 self.train_metrics.update("diffusion_loss", latent_loss.mean().item())
+                self.train_metrics.update("latent_gradient_loss", grad_loss.mean().item())
 
                 loss = loss / self.gradient_accumulation_steps
                 loss.backward()

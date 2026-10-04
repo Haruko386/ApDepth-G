@@ -169,8 +169,9 @@ Prepare for [Hypersim](https://github.com/apple/ml-hypersim) and [Virtual KITTI 
 
 The `master` experiment uses **Masked Prior-Residual v-Diffusion**. DDIM predicts a
 multi-step correction around the frozen DA2 prior instead of an unconstrained absolute
-depth latent. VGC and structured noise are removed; invalid GT is censored before VAE
-encoding, and training/inference use the same zero-terminal-SNR v-prediction schedule. See the
+depth latent. VGC is changed from an invalid-region auxiliary loss into target censoring before
+VAE encoding. Existing structured noise and latent-gradient training remain, while
+training/inference use the same zero-terminal-SNR v-prediction schedule. See the
 [experiment note](doc/prior_anchored_residual_diffusion.md).
 
 Start a new run from SD2; do not resume a VGC, epsilon, or older residual checkpoint:
