@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import torch
-from diffusers import DDPMScheduler
+from diffusers import DDIMScheduler, DDPMScheduler
 from torch import nn
 
 from src.util.config_util import recursive_load_config
@@ -16,6 +16,10 @@ from src.util.prior_residual import (
     load_parameterization, save_parameterization,
 )
 from src.util.model_overrides import load_unet_checkpoint
+from src.util.diffusion_training import (
+    conservative_latent_valid_mask, fill_invalid_depth_with_prior,
+    make_v_prediction_schedulers, min_snr_v_weight,
+)
 
 
 class PriorResidualTest(unittest.TestCase):
@@ -42,7 +46,41 @@ class PriorResidualTest(unittest.TestCase):
         cfg = recursive_load_config("config/train_marigold.yaml")
         self.assertEqual(cfg.depth_parameterization.mode, PRIOR_RESIDUAL)
         self.assertEqual(cfg.depth_parameterization.residual_scale, 1.0)
-        self.assertTrue(cfg.validity_guided_completion.enabled)
+        self.assertNotIn("validity_guided_completion", cfg)
+        self.assertIsNone(cfg.multi_res_noise)
+        self.assertEqual(cfg.masked_latent_training.boundary_margin, 2)
+        self.assertEqual(cfg.diffusion_schedule.prediction_type, "v_prediction")
+        self.assertTrue(cfg.diffusion_schedule.rescale_betas_zero_snr)
+        self.assertEqual(cfg.diffusion_schedule.timestep_spacing, "trailing")
+
+    def test_v_schedule_and_invalid_depth_censoring(self):
+        base = DDPMScheduler(num_train_timesteps=100, prediction_type="epsilon")
+        train_scheduler, infer_scheduler = make_v_prediction_schedulers(base, base)
+        self.assertEqual(train_scheduler.config.prediction_type, "v_prediction")
+        self.assertEqual(train_scheduler.alphas_cumprod[-1].item(), 0)
+        self.assertEqual(infer_scheduler.config.timestep_spacing, "trailing")
+        infer_scheduler.set_timesteps(10)
+        self.assertEqual(infer_scheduler.timesteps[0].item(), 99)
+        endpoint_weight = min_snr_v_weight(
+            train_scheduler.alphas_cumprod[-1:].reshape(1, 1, 1, 1)
+        )
+        torch.testing.assert_close(
+            endpoint_weight, torch.full_like(endpoint_weight, 0.05)
+        )
+
+        depth = torch.full((1, 1, 16, 24), -1.0)
+        valid = torch.ones_like(depth, dtype=torch.bool)
+        valid[..., :8, :8] = False
+        prior = torch.full((1, 3, 16, 24), 0.75)
+        filled = fill_invalid_depth_with_prior(depth, valid, prior)
+        self.assertTrue(torch.all(filled[..., :8, :8] == 0.75))
+        self.assertTrue(torch.all(filled[..., 8:, 8:] == -1.0))
+
+        no_margin = conservative_latent_valid_mask(valid, (2, 3), 0)
+        self.assertFalse(no_margin[0, 0, 0, 0])
+        self.assertTrue(no_margin[0, 0, 1, 1])
+        with_margin = conservative_latent_valid_mask(valid, (2, 3), 1)
+        self.assertLess(with_margin.sum(), no_margin.sum())
 
     def test_inference_loader_restores_parameterization(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -51,6 +89,12 @@ class PriorResidualTest(unittest.TestCase):
             save_parameterization(
                 root / "depth_parameterization.json", PRIOR_RESIDUAL, .75
             )
+            DDIMScheduler(
+                num_train_timesteps=100,
+                prediction_type="v_prediction",
+                rescale_betas_zero_snr=True,
+                timestep_spacing="trailing",
+            ).save_pretrained(root / "scheduler")
 
             class FakeUnet:
                 config = SimpleNamespace(in_channels=12)
@@ -82,6 +126,7 @@ class PriorResidualTest(unittest.TestCase):
                     sys.modules[module_name] = previous
             self.assertEqual((mode, scale), (PRIOR_RESIDUAL, .75))
             self.assertEqual((pipe.mode, pipe.scale), (PRIOR_RESIDUAL, .75))
+            self.assertEqual(pipe.scheduler.config.prediction_type, "v_prediction")
 
     def test_real_trainer_uses_residual_state_and_safe_conv_initialization(self):
         fake_da2 = ModuleType("DA2.depth_anything_v2.dpt")
@@ -137,6 +182,7 @@ class PriorResidualTest(unittest.TestCase):
         cfg.max_iter = cfg.max_epoch = 1
         cfg.lr_scheduler.kwargs.warmup_steps = 0
         cfg.trainer.save_period = cfg.trainer.backup_period = 0
+        cfg.masked_latent_training.boundary_margin = 0
         pipe = Pipeline()
         original = pipe.unet.conv_in.weight.detach().clone()
         valid = torch.ones(1, 1, 32, 32, dtype=torch.bool)
@@ -158,6 +204,11 @@ class PriorResidualTest(unittest.TestCase):
             torch.testing.assert_close(pipe.unet.conv_in.weight[:, 8:12], original * .5)
             self.assertEqual(pipe.depth_prediction_mode, PRIOR_RESIDUAL)
             self.assertFalse(any(parameter.requires_grad for parameter in pipe.da2.parameters()))
+            self.assertEqual(trainer.prediction_type, "v_prediction")
+            self.assertEqual(
+                trainer.training_noise_scheduler.alphas_cumprod[-1].item(), 0
+            )
+            self.assertEqual(pipe.scheduler.config.timestep_spacing, "trailing")
             trainer.save_checkpoint = MagicMock()
             trainer.train()
         self.assertEqual(trainer.effective_iter, 1)

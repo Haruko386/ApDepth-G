@@ -45,10 +45,14 @@ trainer:
   validation_period: 30000
   visualization_period: 40000
 
-multi_res_noise:
-  strength: 0.9
-  annealed: true
-  downscale_strategy: original
+diffusion_schedule:
+  prediction_type: v_prediction
+  rescale_betas_zero_snr: true
+  timestep_spacing: trailing
+
+# Standard Gaussian noise now matches the actual DDIM inference start exactly.
+# Multi-resolution and offset noise are intentionally disabled in this branch.
+multi_res_noise: null
 
 gt_depth_type: depth_raw_norm
 gt_mask_type: valid_mask_raw
@@ -71,12 +75,12 @@ depth_parameterization:
   mode: prior_residual
   residual_scale: 1.0
 
-validity_guided_completion:
-  enabled: true
-  min_invalid_ratio: 0.08
-  anchor_weight: 0.02
-  smooth_weight: 0.005
-  eps: 1.0e-6
+# Only uncontaminated valid latent cells receive supervision. Invalid pixels are
+# filled with DA2 before VAE encoding, but remain excluded from every loss.
+masked_latent_training:
+  boundary_margin: 2
+  min_snr_gamma: 5.0
+  endpoint_weight_floor: 0.05
 
 lr: 3.0e-05
 lr_scheduler:
@@ -111,6 +115,3 @@ eval:
   - delta3_acc
   - i_rmse
   - silog_rmse
-
-normal_loss:
-  weight: 0.5

@@ -167,19 +167,20 @@ into `${BASE_CKPT_DIR}/sd2-1`.
 
 Prepare for [Hypersim](https://github.com/apple/ml-hypersim) and [Virtual KITTI 2](https://europe.naverlabs.com/research/computer-vision/proxy-virtual-worlds-vkitti-2/) datasets and save into `${BASE_DATA_DIR}`. Please refer to [this README](script/dataset_preprocess/hypersim/README.md) for Hypersim preprocessing.
 
-The `master` experiment uses **Prior-Anchored Residual Diffusion**. DDIM predicts a
+The `master` experiment uses **Masked Prior-Residual v-Diffusion**. DDIM predicts a
 multi-step correction around the frozen DA2 prior instead of an unconstrained absolute
-depth latent. Original VGC remains enabled and no new sky label is required. See the
+depth latent. VGC and structured noise are removed; invalid GT is censored before VAE
+encoding, and training/inference use the same zero-terminal-SNR v-prediction schedule. See the
 [experiment note](doc/prior_anchored_residual_diffusion.md).
 
-Start a new run from SD2; do not resume an absolute-depth VGC checkpoint:
+Start a new run from SD2; do not resume a VGC, epsilon, or older residual checkpoint:
 
 ```bash
 python train.py \
   --config config/train_marigold.yaml \
   --base_data_dir "${BASE_DATA_DIR}" \
   --base_ckpt_dir "${BASE_CKPT_DIR}" \
-  --output_dir output/unet_prior_residual_v1 \
+  --output_dir output/unet_masked_residual_vpred_v2 \
   --no_wandb
 ```
 
@@ -187,7 +188,7 @@ Resume only the same residual-diffusion run:
 
 ```bash
 python train.py \
-  --resume_run output/unet_prior_residual_v1/train_marigold/checkpoint/latest \
+  --resume_run output/unet_masked_residual_vpred_v2/train_marigold/checkpoint/latest \
   --base_data_dir "${BASE_DATA_DIR}" \
   --base_ckpt_dir "${BASE_CKPT_DIR}" \
   --no_wandb
@@ -199,9 +200,9 @@ Evaluate with the checkpoint parent directory so `unet/` and
 ```bash
 python run.py \
   --checkpoint "${BASE_CKPT_DIR}/sd2-1" \
-  --unet_checkpoint output/unet_prior_residual_v1/train_marigold/checkpoint/iter_004000 \
+  --unet_checkpoint output/unet_masked_residual_vpred_v2/train_marigold/checkpoint/iter_004000 \
   --input_rgb_dir output/out \
-  --output_dir output/prior_residual_004000 \
+  --output_dir output/masked_residual_vpred_004000 \
   --denoise_steps 50 --ensemble_size 1 --processing_res 768 --seed 2024
 ```
 

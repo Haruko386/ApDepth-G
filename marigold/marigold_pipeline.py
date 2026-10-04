@@ -455,14 +455,15 @@ class MarigoldPipeline(DiffusionPipeline):
                 [rgb_latent, da2_depth_latent, state_latent], dim=1
             )  # this order is important
 
-            # predict the noise residual
-            noise_pred = self.unet(
+            # The checkpoint scheduler is strict v-prediction; the U-Net output
+            # is velocity, not epsilon.
+            velocity_pred = self.unet(
                 unet_input, t, encoder_hidden_states=batch_empty_text_embed
             ).sample  # [B, 4, h, w]
 
             # compute the previous noisy sample x_t -> x_t-1
             state_latent = self.scheduler.step(
-                noise_pred, t, state_latent, generator=generator
+                velocity_pred, t, state_latent, generator=generator
             ).prev_sample
 
         depth_latent = compose_depth_latent(

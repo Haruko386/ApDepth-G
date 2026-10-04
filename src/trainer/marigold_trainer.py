@@ -28,7 +28,7 @@ from typing import List, Union
 
 import numpy as np
 import torch
-from diffusers import DDPMScheduler
+from diffusers import DDIMScheduler, DDPMScheduler
 from omegaconf import OmegaConf
 from torch.nn import Conv2d
 from torch.nn.parameter import Parameter
@@ -42,15 +42,17 @@ from marigold.marigold_pipeline import MarigoldPipeline, MarigoldDepthOutput
 from src.util import metric
 from src.util.data_loader import skip_first_batches
 from src.util.logging_util import tb_logger, eval_dic_to_text
-from src.util.loss import get_loss
-from src.util.loss import LatentGradLoss
 from src.util.lr_scheduler import IterExponential
 from src.util.metric import MetricTracker
-from src.util.multi_res_noise import multi_res_noise_like
 from src.util.alignment import align_depth_least_square
 from src.util.seeding import generate_seed_sequence
+from src.util.diffusion_training import (
+    V_PREDICTION, conservative_latent_valid_mask,
+    fill_invalid_depth_with_prior, make_v_prediction_schedulers,
+    min_snr_v_weight, validate_v_scheduler,
+)
 from src.util.prior_residual import (
-    compose_depth_latent, diffusion_target,
+    diffusion_target,
     load_parameterization, save_parameterization, validate_parameterization,
 )
 
@@ -114,9 +116,8 @@ class MarigoldTrainer:
         )
         self.lr_scheduler = LambdaLR(optimizer=self.optimizer, lr_lambda=lr_func)
 
-        # Loss
-        self.loss = get_loss(loss_name=self.cfg.loss.name, **self.cfg.loss.kwargs)
-        self.latent_grad_loss = LatentGradLoss()
+        if self.cfg.loss.name != "mse_loss":
+            raise ValueError("v-prediction training requires an MSE diffusion loss")
 
         parameterization_cfg = self.cfg.get("depth_parameterization", {})
         self.depth_prediction_mode, self.depth_residual_scale = validate_parameterization(
@@ -127,36 +128,38 @@ class MarigoldTrainer:
             self.depth_prediction_mode, self.depth_residual_scale
         )
 
-        # Validity-Guided Completion (VGC)
-        # This is a mask-free sky-collapse regularizer: it does not use sky masks
-        # or extra input channels. It only acts on regions without valid depth
-        # supervision, which are common in outdoor sky / out-of-range areas.
-        vgc_cfg = self.cfg.get("validity_guided_completion", {})
-        self.vgc_enabled = bool(vgc_cfg.get("enabled", False))
-        self.vgc_min_invalid_ratio = float(vgc_cfg.get("min_invalid_ratio", 0.08))
-        self.vgc_anchor_weight = float(vgc_cfg.get("anchor_weight", 0.02))
-        self.vgc_smooth_weight = float(vgc_cfg.get("smooth_weight", 0.005))
-        self.vgc_eps = float(vgc_cfg.get("eps", 1e-6))
+        mask_cfg = self.cfg.get("masked_latent_training", {})
+        self.latent_boundary_margin = int(mask_cfg.get("boundary_margin", 2))
+        self.min_snr_gamma = float(mask_cfg.get("min_snr_gamma", 5.0))
+        self.endpoint_weight_floor = float(
+            mask_cfg.get("endpoint_weight_floor", 0.05)
+        )
 
         # Training noise scheduler
-        self.training_noise_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
+        base_training_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
             os.path.join(
                 base_ckpt_dir,
                 cfg.trainer.training_noise_scheduler.pretrained_path,
                 "scheduler",
             )
         )
-        self.prediction_type = self.training_noise_scheduler.config.prediction_type
-        assert (
-            self.prediction_type == self.model.scheduler.config.prediction_type
-        ), "Different prediction types"
+        self.training_noise_scheduler, self.model.scheduler = (
+            make_v_prediction_schedulers(
+                base_training_scheduler,
+                self.model.scheduler,
+                self.cfg.get("diffusion_schedule", {}),
+            )
+        )
+        validate_v_scheduler(self.training_noise_scheduler)
+        validate_v_scheduler(self.model.scheduler)
+        self.prediction_type = V_PREDICTION
         self.scheduler_timesteps = (
             self.training_noise_scheduler.config.num_train_timesteps
         )
 
         # Eval metrics
         self.metric_funcs = [getattr(metric, _met) for _met in cfg.eval.eval_metrics]
-        self.train_metrics = MetricTracker(*["loss"])
+        self.train_metrics = MetricTracker("loss", "diffusion_loss")
         self.val_metrics = MetricTracker(*[m.__name__ for m in self.metric_funcs])
         # main metric for best checkpoint saving
         self.main_val_metric = cfg.validation.main_val_metric
@@ -177,13 +180,10 @@ class MarigoldTrainer:
         self.val_period = self.cfg.trainer.validation_period
         self.vis_period = self.cfg.trainer.visualization_period
 
-        # Multi-resolution noise
-        self.apply_multi_res_noise = self.cfg.multi_res_noise is not None
-        if self.apply_multi_res_noise:
-            self.mr_noise_strength = self.cfg.multi_res_noise.strength
-            self.annealed_mr_noise = self.cfg.multi_res_noise.annealed
-            self.mr_noise_downscale_strategy = (
-                self.cfg.multi_res_noise.downscale_strategy
+        if self.cfg.get("multi_res_noise") is not None:
+            raise ValueError(
+                "This experiment requires standard Gaussian noise; "
+                "set multi_res_noise to null."
             )
 
         # Internal variables
@@ -281,18 +281,12 @@ class MarigoldTrainer:
 
                 # Get data
                 rgb = batch["rgb_norm"].to(device)
-                depth_gt_for_latent = batch[self.gt_depth_type].to(device)
+                raw_depth_gt = batch[self.gt_depth_type].to(device)
                 with torch.no_grad():
                     da2_depth = self.model.da2.infer_batch(rgb).to(device)
 
                 if self.gt_mask_type is not None:
                     valid_mask_for_latent = batch[self.gt_mask_type].to(device)
-                    invalid_mask = ~valid_mask_for_latent
-                    valid_mask_down = ~torch.max_pool2d(
-                        invalid_mask.float(), 8, 8
-                    ).bool()
-                    valid_mask_down = valid_mask_down.repeat((1, 4, 1, 1))
-                    invalid_mask_down = ~valid_mask_down
                 else:
                     raise NotImplementedError
 
@@ -301,12 +295,23 @@ class MarigoldTrainer:
                 with torch.no_grad():
                     # Encode image
                     rgb_latent = self.model.encode_rgb(rgb)  # [B, 4, h, w]
-                    # Encode GT depth
+                    # Invalid raw depth is the near-plane value after normalization.
+                    # Replace it before VAE encoding so it cannot leak through the
+                    # encoder receptive field into otherwise valid boundary cells.
+                    depth_gt_for_latent = fill_invalid_depth_with_prior(
+                        raw_depth_gt, valid_mask_for_latent, da2_depth
+                    )
                     gt_depth_latent = self.encode_depth(
                         depth_gt_for_latent
                     )  # [B, 4, h, w]
                     # Encode DA2 depth
                     da2_depth_latent = self.model.encode_rgb(da2_depth)  # [B, 4, h, w]
+
+                valid_mask_down = conservative_latent_valid_mask(
+                    valid_mask_for_latent,
+                    gt_depth_latent.shape[-2:],
+                    self.latent_boundary_margin,
+                ).expand_as(gt_depth_latent)
 
                 target_state_latent = diffusion_target(
                     gt_depth_latent,
@@ -324,31 +329,13 @@ class MarigoldTrainer:
                     generator=rand_num_generator,
                 ).long()  # [B]
 
-                if self.apply_multi_res_noise:
-                    strength = self.mr_noise_strength
-                    if self.annealed_mr_noise:
-                        strength = strength * (timesteps / self.scheduler_timesteps)
-                    noise = multi_res_noise_like(
-                        target_state_latent,
-                        strength=strength,
-                        downscale_strategy=self.mr_noise_downscale_strategy,
-                        generator=rand_num_generator,
-                        device=device,
-                    )
-                else:
-                    noise = torch.randn(
-                        target_state_latent.shape,
-                        device=device,
-                        generator=rand_num_generator,
-                    )  # [B, 4, h, w]
-                
-                offset_noise_strength = 0.1
-                offset_noise = torch.randn(
-                    batch_size, gt_depth_latent.shape[1], 1, 1, 
-                    device=device, 
-                    generator=rand_num_generator
-                ) * offset_noise_strength
-                noise = noise + offset_noise
+                # Match inference exactly: the terminal state is standard Gaussian.
+                # Structured and channel-wise offset noise are intentionally absent.
+                noise = torch.randn(
+                    target_state_latent.shape,
+                    device=device,
+                    generator=rand_num_generator,
+                )  # [B, 4, h, w]
 
                 # Add noise to the latents (diffusion forward process)
                 noisy_latents = self.training_noise_scheduler.add_noise(
@@ -366,7 +353,7 @@ class MarigoldTrainer:
                 )  # [B, 12, h, w]
                 cat_latents = cat_latents.float()
 
-                # Predict the noise residual
+                # Predict velocity. Epsilon prediction is deliberately unsupported.
                 model_pred = self.model.unet(
                     cat_latents, timesteps, text_embed
                 ).sample  # [B, 4, h, w]
@@ -374,74 +361,33 @@ class MarigoldTrainer:
                 if torch.isnan(model_pred).any():
                     logging.warning("model_pred contains NaN.")
 
-                # Get the target for loss depending on the prediction type
-                if "sample" == self.prediction_type:
-                    target = target_state_latent
-                elif "epsilon" == self.prediction_type:
-                    target = noise
-                elif "v_prediction" == self.prediction_type:
-                    target = self.training_noise_scheduler.get_velocity(
-                        target_state_latent, noise, timesteps
-                    )  # [B, 4, h, w]
-                else:
-                    raise ValueError(f"Unknown prediction type {self.prediction_type}")
+                target = self.training_noise_scheduler.get_velocity(
+                    target_state_latent, noise, timesteps
+                )  # [B, 4, h, w]
                 
                 alphas_cumprod = self.training_noise_scheduler.alphas_cumprod.to(device)
                 alpha_prod_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
-                beta_prod_t = 1 - alpha_prod_t
-
-                if "v_prediction" == self.prediction_type:
-                    pred_state_x0 = (alpha_prod_t ** 0.5) * noisy_latents - (beta_prod_t ** 0.5) * model_pred
-                elif "epsilon" == self.prediction_type:
-                    pred_state_x0 = (noisy_latents - (beta_prod_t ** 0.5) * model_pred) / (alpha_prod_t ** 0.5)
-                else:
-                    pred_state_x0 = model_pred # sample type
-
-                pred_depth_x0 = compose_depth_latent(
-                    pred_state_x0,
-                    da2_depth_latent,
-                    self.depth_prediction_mode,
-                    self.depth_residual_scale,
+                snr_weight = min_snr_v_weight(
+                    alpha_prod_t,
+                    gamma=self.min_snr_gamma,
+                    endpoint_floor=self.endpoint_weight_floor,
                 )
 
-            
-                snr = alpha_prod_t / beta_prod_t
-                min_snr_gamma = 5.0
-                snr_weight = torch.clamp(snr, max=min_snr_gamma) / snr
-
                 diff = model_pred.float() - target.float()
-                if "l1" in self.cfg.loss.name.lower():
-                    unreduced_loss = torch.abs(diff)
-                else:
-                    unreduced_loss = torch.square(diff)
-                
+                unreduced_loss = torch.square(diff)
                 unreduced_loss = unreduced_loss * snr_weight
 
                 if self.gt_mask_type is not None:
-                    latent_loss = unreduced_loss[valid_mask_down]
-                    grad_loss = self.latent_grad_loss(
-                        pred_depth_x0.float(),
-                        gt_depth_latent.float(), 
-                        valid_mask_down
-                    )
+                    latent_loss = torch.where(
+                        valid_mask_down, unreduced_loss, 0.0
+                    ).sum() / valid_mask_down.sum().clamp_min(1)
                 else:
                     latent_loss = unreduced_loss
-                    grad_loss = self.latent_grad_loss(pred_depth_x0.float(), gt_depth_latent.float())
 
-                loss = latent_loss.mean() + 0.1 * grad_loss.mean()
-
-                if self.vgc_enabled:
-                    # VGC only supervises invalid-depth regions. This prevents the
-                    # regularizer from changing NYU-style valid indoor regions, while
-                    # still giving sky / out-of-range regions a weak geometric target.
-                    vgc_loss = self._validity_guided_completion_loss(
-                        pred_x0=pred_depth_x0.float(),
-                        prior_latent=da2_depth_latent.float().detach(),
-                        invalid_mask=invalid_mask_down,
-                    )
-                    loss = loss + vgc_loss
+                loss = latent_loss.mean()
 
                 self.train_metrics.update("loss", loss.item())
+                self.train_metrics.update("diffusion_loss", latent_loss.mean().item())
 
                 loss = loss / self.gradient_accumulation_steps
                 loss.backward()
@@ -505,58 +451,6 @@ class MarigoldTrainer:
 
             # Epoch end
             self.n_batch_in_epoch = 0
-
-    def _validity_guided_completion_loss(self, pred_x0, prior_latent, invalid_mask):
-        """Weakly complete invalid-depth regions using the detached DA2 prior.
-
-        Outdoor sky and out-of-range regions are often excluded by the valid-depth
-        mask, so the normal supervised loss gives them no training signal. VGC
-        adds a small training-only loss on those invalid regions, without using a
-        sky segmentation mask and without changing the 12-channel input.
-        """
-        if invalid_mask is None:
-            return pred_x0.new_tensor(0.0)
-
-        invalid_mask = invalid_mask.to(device=pred_x0.device, dtype=pred_x0.dtype)
-        if invalid_mask.shape != pred_x0.shape:
-            invalid_mask = invalid_mask.expand_as(pred_x0)
-
-        # Avoid applying the loss to tiny missing-depth holes. This is important
-        # for indoor datasets such as NYU, where most pixels are valid and small
-        # invalid holes should not dominate training.
-        invalid_ratio = invalid_mask.flatten(1).mean(dim=1)  # [B]
-        sample_gate = (invalid_ratio >= self.vgc_min_invalid_ratio).to(pred_x0.dtype)
-        if sample_gate.sum() <= 0:
-            return pred_x0.new_tensor(0.0)
-
-        sample_gate = sample_gate.view(-1, 1, 1, 1)
-        mask = invalid_mask * sample_gate
-        denom = mask.sum().clamp_min(self.vgc_eps)
-
-        # Region-level anchor: align only the mean latent response in invalid
-        # regions to the prior. This prevents copying high-frequency DA2 artifacts
-        # into sky while still preventing free collapse.
-        pred_region_mean = (pred_x0 * mask).sum(dim=(2, 3), keepdim=True) / (
-            mask.sum(dim=(2, 3), keepdim=True).clamp_min(self.vgc_eps)
-        )
-        prior_region_mean = (prior_latent * mask).sum(dim=(2, 3), keepdim=True) / (
-            mask.sum(dim=(2, 3), keepdim=True).clamp_min(self.vgc_eps)
-        )
-        anchor_loss = ((pred_region_mean - prior_region_mean) ** 2 * sample_gate).sum() / (
-            sample_gate.sum().clamp_min(self.vgc_eps) * pred_x0.shape[1]
-        )
-
-        # Smooth invalid regions only. This suppresses sky-like texture collapse but
-        # does not smooth valid object boundaries.
-        grad_x = torch.abs(pred_x0[..., 1:] - pred_x0[..., :-1])
-        grad_y = torch.abs(pred_x0[:, :, 1:, :] - pred_x0[:, :, :-1, :])
-        mask_x = mask[..., 1:] * mask[..., :-1]
-        mask_y = mask[:, :, 1:, :] * mask[:, :, :-1, :]
-        smooth_x = (grad_x * mask_x).sum() / mask_x.sum().clamp_min(self.vgc_eps)
-        smooth_y = (grad_y * mask_y).sum() / mask_y.sum().clamp_min(self.vgc_eps)
-        smooth_loss = 0.5 * (smooth_x + smooth_y)
-
-        return self.vgc_anchor_weight * anchor_loss + self.vgc_smooth_weight * smooth_loss
 
     def encode_depth(self, depth_in):
         # stack depth into 3-channel
@@ -788,6 +682,9 @@ class MarigoldTrainer:
             self.depth_prediction_mode,
             self.depth_residual_scale,
         )
+        scheduler_path = os.path.join(ckpt_dir, "scheduler")
+        self.model.scheduler.save_pretrained(scheduler_path)
+        logging.info(f"v-prediction scheduler is saved to: {scheduler_path}")
 
         if save_train_state:
             state = {
@@ -829,6 +726,15 @@ class MarigoldTrainer:
                 f"saved={(saved_mode, saved_scale)}, "
                 f"configured={(self.depth_prediction_mode, self.depth_residual_scale)}"
             )
+        scheduler_path = os.path.join(ckpt_path, "scheduler")
+        if not os.path.isdir(scheduler_path):
+            raise ValueError(
+                "Checkpoint has no scheduler/ and cannot be resumed as a "
+                "v-prediction run. Start this experiment from SD2."
+            )
+        saved_scheduler = DDIMScheduler.from_pretrained(scheduler_path)
+        validate_v_scheduler(saved_scheduler)
+        self.model.scheduler = saved_scheduler
         # Load UNet
         _model_path = os.path.join(ckpt_path, "unet", "diffusion_pytorch_model.bin")
         self.model.unet.load_state_dict(

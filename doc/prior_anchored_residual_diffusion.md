@@ -1,20 +1,21 @@
-# master 实验：Prior-Anchored Residual Diffusion
+# master 实验：Masked Prior-Residual v-Diffusion
 
-2026-10-04。状态：已实现并通过小模型训练测试，尚未运行真实 SD2 + DA2-Giant 训练，
-不能宣称已经解决天空塌陷。
+日期：2026-10-04。状态：实现完成，尚未进行真实 SD2 + DA2-Giant 训练，不能提前宣称已解决天空塌陷。
 
-## 核心变化
+## 为什么不再保留 VGC
 
-原模型让 DDIM 从噪声直接生成绝对深度 latent：
+VGC 把无效深度区域近似成天空/远场，并在该区域施加 DA2 区域均值锚点和平滑损失。此前多个失败实验都出现了相同规律：对 sky、far-field 或 invalid region 增加直接监督后，天空更容易出现斑点、错误坡度或远近反转。
 
-```text
-noise -> z_depth
-```
+`invalid depth` 还包括越界深度、遮挡、传感器空洞等内容，并不等价于天空。为避免继续重复这个问题，master 实验完全删除 VGC：
 
-在天空和超量程区域没有有效 GT 时，绝对 latent 可以沿多步轨迹自由漂移。即使 DA2 latent
-作为输入条件存在，U-Net 仍然可以忽略它或把它解释成普通纹理条件。
+- 不计算 invalid-region anchor；
+- 不计算 invalid-region smoothness；
+- 不使用 sky mask 或天空伪标签；
+- 不扩大有效 GT 范围。
 
-本实验把扩散变量改成相对 DA2 prior 的修正量：
+## 新的扩散变量
+
+模型仍使用 DA2-Giant，但扩散过程生成相对于冻结 DA2 的修正量：
 
 ```text
 r_gt = (z_gt - stop_grad(z_DA2)) / s
@@ -23,26 +24,45 @@ r_T -> ... -> r_0
 z_depth = z_DA2 + s * r_0
 ```
 
-当前 `s = 1.0`。主 diffusion loss 仍只在有效 GT latent cell 上计算；latent gradient 和原 VGC
-作用于组合后的绝对深度 `z_DA2 + r_0`。没有增加 sky mask、天空伪标签或远端主监督。
+当前 `s=1.0`。DA2 因而是最终预测的显式基准，不再只是一个可能被 U-Net 忽略的输入条件。
 
-这样做的目标不是复制 DA2，而是把 DA2 从“可被忽略的输入”提升为显式基准：有可靠 GT 的区域
-学习修正 DA2；没有可靠 GT 的天空区域默认围绕零修正建模，并由原 VGC 弱约束区域均值和光滑性。
+## 无效 GT 的处理
 
-该方向受到 [Lotus-2](https://arxiv.org/abs/2512.01030) 中“在核心预测器定义的流形内进行受约束
-多步 refinement”的启发，但本实现仍是 SD2 DDIM epsilon diffusion，不是 Lotus-2 的单步核心模型
-或 rectified flow，不能把论文结论直接当作本项目结果。
+旧数据流程会把无效原始深度归一化成 `-1`，对应近端。之后即使在 latent loss 上屏蔽无效 cell，VAE 编码器的感受野仍可能把这个错误近端值传播到天空边界附近的有效 latent。
 
-## 安全初始化
-
-12 通道顺序保持：
+新流程在 VAE 编码前执行：
 
 ```text
-[RGB latent, DA2 latent, noisy residual latent]
+d_encode = valid * d_gt + (1 - valid) * stop_grad(d_DA2)
 ```
 
-旧初始化把 SD2 的 4 通道卷积权重复制三份后各除以 3，使 DA2 在第 0 步就与 RGB、扩散状态等权。
-新初始化使用：
+这一步只为消除编码污染。无效位置依然不进入 diffusion loss 或 gradient loss。像素 mask 映射到 latent 后，再向有效区域内部收缩 2 个 latent cell，避免边界混合 latent 参与监督。
+
+## 统一 v-prediction
+
+本分支没有 epsilon 训练路径：
+
+- U-Net 只预测 velocity；
+- 训练 scheduler 使用 zero terminal SNR；
+- 50 步 DDIM 使用同一份 v-prediction scheduler 和 `trailing` timestep；
+- checkpoint 必须包含 `scheduler/`，推理缺失时直接报错；
+- Min-SNR 使用 v-prediction 对应权重，纯噪声端点保留 `0.05` 权重。
+
+## 删除结构化噪声
+
+Multi-resolution noise 和 channel-wise offset noise 已关闭。此前训练使用结构化噪声，而多步推理从标准高斯开始，两个分布并不一致。zero-terminal-SNR 已经负责训练纯噪声端点，因此本实验使用标准高斯贯穿训练和推理。
+
+Latent gradient loss 也已删除。VAE 四通道特征的梯度不等价于像素深度梯度，它会额外强调高频和边界，目前没有证据表明这对天空有益。
+
+## 保留内容
+
+- SD2 与冻结的 DA2-Giant；
+- 12 通道 `[RGB latent, DA2 latent, noisy residual latent]`；
+- 有效 GT 上唯一的 Min-SNR v-prediction MSE；
+- 23,000 optimizer steps；
+- 50 步 DDIM 推理。
+
+12 通道首层初始化为：
 
 ```text
 RGB branch            = 0.5 * pretrained weight
@@ -50,24 +70,9 @@ DA2 condition branch  = 0
 residual branch       = 0.5 * pretrained weight
 ```
 
-因此初始激活保持标准 8 通道 Marigold 形式，DA2 条件权重由训练逐渐学出；同时最终深度仍显式加上
-DA2 prior。这样可减少同一 prior 在输入和输出两处同时产生强捷径的风险。
-
-## 保留内容
-
-- SD2、DA2-Giant、12 通道条件；
-- multi-resolution noise、offset noise、Min-SNR、latent gradient；
-- 原始 VGC；
-- 23,000 optimizer steps；
-- 50 步 DDIM 推理；
-- decoder 后训练与本分支无关，未加入此旧分支。
-
-训练器现在显式冻结 DA2 并在 `no_grad` 下生成 prior。每个 checkpoint 除了 `unet/`，还保存
-`depth_parameterization.json`；推理必须同时加载两者，不能只复制 U-Net 权重。
-
 ## 训练
 
-该实验改变了扩散目标，必须从原始 SD2 开始，不能 resume 绝对深度 VGC checkpoint：
+扩散变量和 prediction type 都已改变，必须从原始 SD2 开始，不能加载旧 VGC、epsilon 或上一版 residual checkpoint：
 
 ```bash
 cd /root/ApDepth-G
@@ -75,15 +80,15 @@ python train.py \
   --config config/train_marigold.yaml \
   --base_data_dir /root/Dataset \
   --base_ckpt_dir /root/Marigold/pretrained_checkpoint \
-  --output_dir /root/ApDepth-G/output/unet_prior_residual_v1 \
+  --output_dir /root/ApDepth-G/output/unet_masked_residual_vpred_v2 \
   --no_wandb
 ```
 
-同一次训练中断后恢复：
+同一次实验中断后可以恢复：
 
 ```bash
 python train.py \
-  --resume_run /root/ApDepth-G/output/unet_prior_residual_v1/train_marigold/checkpoint/latest \
+  --resume_run /root/ApDepth-G/output/unet_masked_residual_vpred_v2/train_marigold/checkpoint/latest \
   --base_data_dir /root/Dataset \
   --base_ckpt_dir /root/Marigold/pretrained_checkpoint \
   --no_wandb
@@ -91,15 +96,25 @@ python train.py \
 
 ## 推理
 
+`--unet_checkpoint` 必须指向同时包含 `unet/`、`scheduler/` 和 `depth_parameterization.json` 的 checkpoint 根目录：
+
 ```bash
 python run.py \
   --checkpoint /root/Marigold/pretrained_checkpoint/sd2-1 \
-  --unet_checkpoint /root/ApDepth-G/output/unet_prior_residual_v1/train_marigold/checkpoint/iter_004000 \
+  --unet_checkpoint /root/ApDepth-G/output/unet_masked_residual_vpred_v2/train_marigold/checkpoint/iter_004000 \
   --input_rgb_dir /root/ApDepth-G/output/out \
-  --output_dir /root/ApDepth-G/output/prior_residual_004000 \
-  --denoise_steps 50 --ensemble_size 1 --processing_res 768 --seed 2024
+  --output_dir /root/ApDepth-G/output/masked_residual_vpred_004000 \
+  --denoise_steps 50 \
+  --ensemble_size 1 \
+  --processing_res 768 \
+  --seed 2024
 ```
 
-建议先比较 2k、4k checkpoint。除普通 depth 指标外，应单独测：天空平均深度相对地平线的次序、
-天空内部标准差、天空边界光环以及非天空漂移。若 DA2 自身把天空判断为近处，这一参数化可能直接
-继承错误；latent 加法也不等于像素深度线性相加。这些是本实验必须通过真实结果回答的风险。
+建议先比较 2k 和 4k checkpoint，并固定输入、seed、分辨率。重点检查天空—地平线次序、天空内部方差、边界光环、非天空远景结构和 NYUv2 非退化。
+
+## 已知风险
+
+- 若 DA2 本身在天空区域判断错误，显式 prior 基准可能继承该错误；
+- latent 加法不等价于像素深度线性相加；
+- 收缩监督 mask 会减少天空边界附近的训练样本；
+- 这是一项待验证实验，真实效果必须由 checkpoint 对比决定。
