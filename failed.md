@@ -1387,3 +1387,28 @@ DA2 的语义相似也不等价于同一深度；全图约束可能与原有几�
 
 下一轮因此只改扩散训练与多步采样的端点一致性，不新增任何 sky mask、远端伪标签、GT 有效域
 或 invalid-region loss。具体候选见 `doc/terminal_snr_alignment.md`，仍属于未验证实验。
+
+---
+
+# 15. Terminal-SNR Alignment（2026-10-04：待验证，不是失败记录）
+
+本节放在本文件中是为了保持天空塌陷实验时间线完整，**不表示该方案已失败**。
+
+该方案停止追加 sky / far-field / invalid-region 监督，改为检查扩散训练末端与多步推理起点：
+
+- 使用 `v_prediction`；
+- 把最后一个训练 timestep 重标定到 zero terminal SNR；
+- 50 步 DDIM 使用 `trailing` spacing，从真正的末端 timestep 开始；
+- 给极低 SNR 保留 `0.05` 的小权重下限，避免纯噪声端点梯度被 Min-SNR 清零；
+- 最后 10% timestep 逐渐关闭 multi-resolution noise 和 offset noise，末端强制标准高斯；
+- checkpoint 同时保存匹配的 `unet/` 和 `scheduler/`。
+
+它没有 sky mask、天空伪深度、扩大 GT 有效域或新增 invalid-region loss；原 VGC 和多步去噪保留。
+假设是天空这类大面积弱纹理区域对第一阶段去噪的全局低频漂移更敏感，而原训练端点仍残留
+clean signal、结构化噪声又与推理标准高斯不一致。该假设目前只有数学和实现检查，没有真实训练结论。
+
+**状态：RUNNING / UNVERIFIED。** 不能写成已解决天空塌陷，也不能写入最终贡献结论。
+应在固定 seed 下检查 2k、4k checkpoint 的天空—地平线深度次序、天空内部方差、边界光环以及
+NYUv2 非退化；由于 epsilon 改为 v prediction，loss 数值不能与旧日志直接比较。
+
+完整配置、训练和推理方式见 `doc/terminal_snr_alignment.md`。
