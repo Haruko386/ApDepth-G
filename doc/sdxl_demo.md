@@ -30,7 +30,8 @@ RTX 6000 Ada 上测试完整权重、BF16 或 bitsandbytes CUDA 内核，也没�
 
 - 使用 `stabilityai/stable-diffusion-xl-base-1.0`，不使用 refiner；训练完整 U-Net。
 - RGB / DA2 prior / noisy depth 仍为 4+4+4 通道。多分辨率退火噪声、offset noise、
-  Min-SNR、latent 梯度、`residual_snr` 补全都继承 main；旧 VGC 的 legacy 模式仍保留。
+  Min-SNR、latent 梯度继续保留；补全目标显式使用原始 VGC（`mode: legacy`），
+  SDXL 训练不启用 `residual_snr`。
 - 补齐 SDXL 双编码器的倒数第二层 hidden states、第二编码器的 pooled embedding 和尺寸条件。
   两个文本编码器在 CPU 编码空提示后释放，只保存空提示 embedding。
 - 尺寸条件统一使用实际输入画布 `[H,W,0,0,H,W]`，训练与推理一致。
@@ -155,7 +156,8 @@ python run.py \
 上述命令不要额外添加 `--half_precision`。
 
 `infer.py`、`script.trace_depth_denoising`、`script.cache_decoder_latents` 也支持
-`--backbone sdxl`。原 decoder 后训练继续可用，但必须从新的 SDXL U-Net 重新生成缓存，
+`--backbone sdxl`。decoder 后训练代码和配置继续保留，等主 U-Net 训练完成后再决定是否使用；
+使用时必须从新的 SDXL U-Net 重新生成缓存，
 它会记录匹配的 VAE 和 latent scale。SD2 的 decoder 权重或缓存不能用于 SDXL。
 缓存、校准与恢复流程见 [decoder_calibration.md](decoder_calibration.md)。
 

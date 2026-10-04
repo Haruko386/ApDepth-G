@@ -9,6 +9,17 @@ model:
 pipeline:
   name: SDXLDepthPipeline
 
+# Keep the SDXL experiment on the original VGC objective.  The base SD2
+# configuration currently selects residual_snr, so override every VGC field
+# here instead of depending on inherited defaults.
+validity_guided_completion:
+  enabled: true
+  mode: legacy
+  min_invalid_ratio: 0.08
+  anchor_weight: 0.02
+  smooth_weight: 0.005
+  eps: 1.0e-6
+
 dataloader:
   effective_batch_size: 42
   max_train_batch_size: 1

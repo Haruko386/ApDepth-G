@@ -20,10 +20,10 @@ This repository is based on [Marigold](https://marigoldmonodepth.github.io), CVP
 >
 > The active experiment on the `nightly` branch uses **SDXL Base 1.0** and retains
 > multi-step DDIM depth inference. It trains a 12-channel U-Net conditioned on RGB,
-> a frozen DA2-Giant prior, and noisy depth. The default completion objective is the
-> newer `residual_snr` mode; the original VGC implementation remains available as
-> `legacy`, but the two modes are not applied together. Decoder calibration is a
-> separate optional post-training workflow and is not run by the SDXL training config.
+> a frozen DA2-Giant prior, and noisy depth. SDXL training explicitly uses the original
+> VGC objective (`mode: legacy`); `residual_snr` is not active in this experiment.
+> Decoder calibration is retained as a separate optional post-training workflow and
+> is not run by the SDXL training config.
 
 ## 🛠️ Setup
 
@@ -218,11 +218,11 @@ The SDXL main-training stack enabled by `config/train_sdxl_demo.yaml` is:
 - 12-channel RGB + DA2 prior + noisy-depth conditioning;
 - annealed multi-resolution noise and channel-wise offset noise;
 - prediction-type-correct Min-SNR weighting and valid-region latent-gradient loss;
-- `residual_snr` invalid-region completion, with original VGC retained only as the
-  selectable `legacy` mode.
+- original VGC invalid-region mean anchoring and smoothness (`mode: legacy`).
 
-Removed failed experiments are not re-enabled. Decoder calibration remains in the
-repository as an independent post-training experiment and is not invoked here.
+`residual_snr` and the other removed failed experiments are not enabled by this SDXL
+configuration. Decoder calibration remains in the repository as an independent
+post-training experiment and is not invoked here.
 
 Prepare for [Hypersim](https://github.com/apple/ml-hypersim) and [Virtual KITTI 2](https://europe.naverlabs.com/research/computer-vision/proxy-virtual-worlds-vkitti-2/) datasets and save into `${BASE_DATA_DIR}`. Please refer to [this README](script/dataset_preprocess/hypersim/README.md) for Hypersim preprocessing.
 

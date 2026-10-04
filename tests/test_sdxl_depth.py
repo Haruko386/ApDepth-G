@@ -196,6 +196,11 @@ class SDXLDepthTest(unittest.TestCase):
         self.assertEqual(demo.dataloader.effective_batch_size, 42)
         self.assertEqual(demo.dataloader.max_train_batch_size, 1)
         self.assertEqual(demo.max_iter, 23000)
+        self.assertTrue(demo.validity_guided_completion.enabled)
+        self.assertEqual(demo.validity_guided_completion.mode, "legacy")
+        self.assertEqual(demo.validity_guided_completion.anchor_weight, 0.02)
+        self.assertEqual(demo.validity_guided_completion.smooth_weight, 0.005)
+        self.assertEqual(probe.validity_guided_completion.mode, "legacy")
         self.assertEqual(probe.max_iter, 2)
         self.assertTrue(probe.trainer.memory_probe)
 
