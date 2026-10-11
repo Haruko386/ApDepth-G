@@ -93,6 +93,8 @@ class DiffusionTrainingTest(unittest.TestCase):
         self.assertEqual(cfg.diffusion_schedule.timestep_spacing, "trailing")
         self.assertEqual(cfg.diffusion_schedule.terminal_noise_fade_fraction, .1)
         self.assertEqual(cfg.validity_guided_completion.smooth_weight, .005)
+        self.assertEqual(cfg.validity_guided_completion.far_anchor_weight, .01)
+        self.assertEqual(cfg.validity_guided_completion.far_depth_threshold, .5)
         self.assertNotIn("mode", cfg.validity_guided_completion)
         old = IterExponential(25000, .01, 100)
         new = IterExponential(cfg.lr_scheduler.kwargs.total_iter, .01, cfg.lr_scheduler.kwargs.warmup_steps)
@@ -155,7 +157,9 @@ class DiffusionTrainingTest(unittest.TestCase):
         cfg.trainer.save_period = cfg.trainer.backup_period = 0
         pipeline = Pipeline()
         valid = torch.ones(1, 1, 32, 32, dtype=torch.bool)
-        valid[..., :16, :] = False
+        # Rows 0:8 are fully invalid at latent scale, rows 8:16 are mixed, and
+        # the remainder is fully valid. VGC must not treat the mixed row as sky.
+        valid[..., :12, :] = False
         batch = {"rgb_norm": torch.randn(1, 3, 32, 32),
                  "depth_raw_norm": torch.randn(1, 1, 32, 32), "valid_mask_raw": valid}
         before = pipeline.unet.conv_in.weight.detach().clone()
@@ -169,6 +173,29 @@ class DiffusionTrainingTest(unittest.TestCase):
             self.assertEqual(trainer.prediction_type, "v_prediction")
             self.assertEqual(trainer.training_noise_scheduler.alphas_cumprod[-1].item(), 0)
             self.assertEqual(trainer.model.scheduler.config.timestep_spacing, "trailing")
+            pred = torch.zeros(1, 4, 4, 4)
+            prior = torch.ones_like(pred)
+            invalid = torch.ones_like(pred, dtype=torch.bool)
+            no_far = torch.zeros_like(invalid)
+            some_far = no_far.clone()
+            some_far[..., 0, :] = True
+            loss_without_far = trainer._validity_guided_completion_loss(
+                pred, prior, invalid, no_far
+            )
+            loss_with_far = trainer._validity_guided_completion_loss(
+                pred, prior, invalid, some_far
+            )
+            self.assertGreater(loss_with_far.item(), loss_without_far.item())
+            captured_invalid_masks = []
+            captured_far_masks = []
+            original_vgc = trainer._validity_guided_completion_loss
+
+            def capture_vgc_mask(*args, **kwargs):
+                captured_invalid_masks.append(kwargs["invalid_mask"].detach().clone())
+                captured_far_masks.append(kwargs["far_mask"].detach().clone())
+                return original_vgc(*args, **kwargs)
+
+            trainer._validity_guided_completion_loss = capture_vgc_mask
             trainer.save_checkpoint = MagicMock()
             trainer.train()
         self.assertEqual(trainer.effective_iter, 1)
@@ -177,6 +204,13 @@ class DiffusionTrainingTest(unittest.TestCase):
         torch.testing.assert_close(vae_before, pipeline.vae.weight)
         self.assertIsNone(pipeline.vae.weight.grad)
         self.assertTrue(torch.isfinite(pipeline.unet.conv_in.weight).all())
+        self.assertTrue(captured_invalid_masks)
+        self.assertTrue(captured_invalid_masks[0][..., 0, :].all())
+        self.assertFalse(captured_invalid_masks[0][..., 1:, :].any())
+        self.assertTrue(captured_far_masks)
+        self.assertFalse(
+            (captured_far_masks[0] & ~captured_invalid_masks[0]).any()
+        )
 
 
 if __name__ == "__main__":

@@ -79,10 +79,17 @@ diffusion_schedule:
   terminal_noise_fade_fraction: 0.10
 
 validity_guided_completion:
+  # Conservative DA2 weak supervision: region mean + smoothness on fully
+  # invalid latent cells only. Do not replace this with pixel-wise DA2 targets.
   enabled: true
   min_invalid_ratio: 0.08
   anchor_weight: 0.02
   smooth_weight: 0.005
+  # Extra region-level anchor only where GT is fully invalid and corrected DA2
+  # predicts far depth. This targets sky/far-field without copying DA2 pixels.
+  far_anchor_weight: 0.01
+  far_depth_threshold: 0.50  # corrected DA2 convention: -1 near, +1 far
+  min_far_ratio: 0.02
   eps: 1.0e-6
 
 lr: 3.0e-05

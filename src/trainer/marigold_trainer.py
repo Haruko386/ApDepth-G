@@ -127,7 +127,18 @@ class MarigoldTrainer:
         self.vgc_min_invalid_ratio = float(vgc_cfg.get("min_invalid_ratio", 0.08))
         self.vgc_anchor_weight = float(vgc_cfg.get("anchor_weight", 0.02))
         self.vgc_smooth_weight = float(vgc_cfg.get("smooth_weight", 0.005))
+        self.vgc_far_anchor_weight = float(vgc_cfg.get("far_anchor_weight", 0.0))
+        self.vgc_far_depth_threshold = float(
+            vgc_cfg.get("far_depth_threshold", 0.5)
+        )
+        self.vgc_min_far_ratio = float(vgc_cfg.get("min_far_ratio", 0.02))
         self.vgc_eps = float(vgc_cfg.get("eps", 1e-6))
+        if not -1.0 <= self.vgc_far_depth_threshold <= 1.0:
+            raise ValueError("VGC far_depth_threshold must be in [-1, 1]")
+        if self.vgc_far_anchor_weight < 0:
+            raise ValueError("VGC far_anchor_weight must be non-negative")
+        if not 0.0 <= self.vgc_min_far_ratio <= 1.0:
+            raise ValueError("VGC min_far_ratio must be in [0, 1]")
         self.min_snr_gamma = float(self.cfg.get("min_snr_gamma", 5.0))
         if self.min_snr_gamma <= 0:
             raise ValueError("min_snr_gamma must be positive")
@@ -261,15 +272,27 @@ class MarigoldTrainer:
                 rgb = batch["rgb_norm"].to(device)
                 depth_gt_for_latent = batch[self.gt_depth_type].to(device)
                 with torch.no_grad():
+                    # rgb is ApDepth [-1, 1]. infer_batch converts it to DA2's
+                    # [0, 1] + ImageNet-normalized DINOv2 input, then returns
+                    # near=-1/far=+1 depth in the SD2 VAE input range.
                     da2_depth = self.model.da2.infer_batch(rgb).to(device)
+                    da2_far_pixels = (
+                        da2_depth[:, :1] >= self.vgc_far_depth_threshold
+                    )
 
                 if self.gt_mask_type is not None:
                     valid_mask_for_latent = batch[self.gt_mask_type].to(device)
-                    valid_mask_down, _ = latent_validity_masks(
+                    valid_mask_down, invalid_mask_down = latent_validity_masks(
                         valid_mask_for_latent
                     )
+                    # A DA2-far latent cell is selected only if its entire 8x8
+                    # source block is far. Mixed sky/object boundary cells are
+                    # excluded instead of being smoothed across the boundary.
+                    da2_far_mask_down, _ = latent_validity_masks(da2_far_pixels)
                     valid_mask_down = valid_mask_down.repeat((1, 4, 1, 1))
-                    invalid_mask_down = ~valid_mask_down
+                    invalid_mask_down = invalid_mask_down.repeat((1, 4, 1, 1))
+                    da2_far_mask_down = da2_far_mask_down.repeat((1, 4, 1, 1))
+                    da2_far_mask_down = da2_far_mask_down & invalid_mask_down
                 else:
                     raise NotImplementedError
 
@@ -282,7 +305,8 @@ class MarigoldTrainer:
                     gt_depth_latent = self.encode_depth(
                         depth_gt_for_latent
                     )  # [B, 4, h, w]
-                    # Encode DA2 depth
+                    # infer_batch has already mapped raw DA2 disparity to
+                    # [-1, 1]; encode_rgb must never receive raw DA2 output.
                     da2_depth_latent = self.model.encode_rgb(da2_depth)  # [B, 4, h, w]
                 
                 # Sample a random timestep for each image
@@ -424,6 +448,7 @@ class MarigoldTrainer:
                         pred_x0=pred_x0.float(),
                         prior_latent=da2_depth_latent.float().detach(),
                         invalid_mask=invalid_mask_down,
+                        far_mask=da2_far_mask_down,
                     )
                     loss = loss + vgc_loss
 
@@ -495,7 +520,9 @@ class MarigoldTrainer:
             # Epoch end
             self.n_batch_in_epoch = 0
 
-    def _validity_guided_completion_loss(self, pred_x0, prior_latent, invalid_mask):
+    def _validity_guided_completion_loss(
+        self, pred_x0, prior_latent, invalid_mask, far_mask=None
+    ):
         """Weakly complete invalid-depth regions using the detached DA2 prior.
 
         Outdoor sky and out-of-range regions are often excluded by the valid-depth
@@ -520,8 +547,6 @@ class MarigoldTrainer:
 
         sample_gate = sample_gate.view(-1, 1, 1, 1)
         mask = invalid_mask * sample_gate
-        denom = mask.sum().clamp_min(self.vgc_eps)
-
         # Region-level anchor: align only the mean latent response in invalid
         # regions to the prior. This prevents copying high-frequency DA2 artifacts
         # into sky while still preventing free collapse.
@@ -545,7 +570,41 @@ class MarigoldTrainer:
         smooth_y = (grad_y * mask_y).sum() / mask_y.sum().clamp_min(self.vgc_eps)
         smooth_loss = 0.5 * (smooth_x + smooth_y)
 
-        return self.vgc_anchor_weight * anchor_loss + self.vgc_smooth_weight * smooth_loss
+        # Corrected DA2 uses near=-1/far=+1 in pixel space. Add another weak
+        # region-mean anchor for the subset that is both fully GT-invalid and
+        # confidently far according to DA2. We intentionally do not compare
+        # individual latent pixels because that would copy DA2 sky texture.
+        far_anchor_loss = pred_x0.new_zeros(())
+        if far_mask is not None and self.vgc_far_anchor_weight > 0:
+            far_mask = far_mask.to(device=pred_x0.device, dtype=pred_x0.dtype)
+            if far_mask.shape != pred_x0.shape:
+                far_mask = far_mask.expand_as(pred_x0)
+            far_mask = far_mask * mask
+            far_ratio = far_mask.flatten(1).mean(dim=1)
+            far_gate = (
+                (far_ratio >= self.vgc_min_far_ratio).to(pred_x0.dtype)
+                * sample_gate.flatten()
+            )
+            if far_gate.sum() > 0:
+                far_gate_4d = far_gate.view(-1, 1, 1, 1)
+                far_pred_mean = (pred_x0 * far_mask).sum(
+                    dim=(2, 3), keepdim=True
+                ) / far_mask.sum(dim=(2, 3), keepdim=True).clamp_min(self.vgc_eps)
+                far_prior_mean = (prior_latent * far_mask).sum(
+                    dim=(2, 3), keepdim=True
+                ) / far_mask.sum(dim=(2, 3), keepdim=True).clamp_min(self.vgc_eps)
+                far_anchor_loss = (
+                    (far_pred_mean - far_prior_mean).square()
+                    * far_gate_4d
+                ).sum() / (
+                    far_gate.sum().clamp_min(self.vgc_eps) * pred_x0.shape[1]
+                )
+
+        return (
+            self.vgc_anchor_weight * anchor_loss
+            + self.vgc_smooth_weight * smooth_loss
+            + self.vgc_far_anchor_weight * far_anchor_loss
+        )
 
     def encode_depth(self, depth_in):
         # stack depth into 3-channel

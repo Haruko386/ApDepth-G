@@ -1,5 +1,14 @@
 # ApDepth-G：VGC 之后的天空塌陷修复尝试记录
 
+> 2026-10-11 更新：确认外部 DA2 `infer_batch` 曾存在数据契约错误：项目传入的
+> `[-1, 1]` RGB 未恢复至 `[0, 1]` 并执行 ImageNet 标准化，DA2 输出的近大远小相对视差也未
+> 反向、归一化至项目使用的近 `-1` / 远 `+1`。因此此前所有依赖 DA2 的实验结果都混入了错误
+> teacher 的影响，不能单独用于否定 DA2 弱监督。当前主训练保留原 VGC 的区域均值弱锚点和
+> invalid-region smoothness，并限制在完全无效的 latent cell 上重新验证；另增加一个权重很小的
+> DA2 far-region 区域均值锚点，只覆盖“GT 完全无效且 DA2 明确判断为远处”的 cell。逐像素 DA2 蒸馏、
+> `residual_snr`、CGFD 等更强方案仍不恢复；它们除 teacher 错误外还存在 `invalid ≠ sky`、
+> 目标过强或门控过度等独立问题。
+
 > 2026-10-04 更新：第 14 节记录 `residual_snr` 主训练失败。用户实测天空比原方案更差，
 > 城市场景中天空被预测为近处，并与远处山体/树林形成明显反向层次。该补全项已从主训练移除。
 > 新实验转向扩散端点分布对齐，不再增加天空或 invalid region 监督，见 `doc/terminal_snr_alignment.md`。
