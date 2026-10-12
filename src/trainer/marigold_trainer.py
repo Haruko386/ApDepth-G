@@ -117,6 +117,17 @@ class MarigoldTrainer:
         # Loss
         self.loss = get_loss(loss_name=self.cfg.loss.name, **self.cfg.loss.kwargs)
         self.latent_grad_loss = LatentGradLoss()
+        self.latent_gradient_weight = float(
+            self.cfg.get("latent_gradient_weight", 0.1)
+        )
+        if self.latent_gradient_weight < 0:
+            raise ValueError("latent_gradient_weight must be non-negative")
+
+        # Keep the 12-channel U-Net shape fixed for the DA2 ablation. Setting
+        # this to false replaces only the DA2 conditioning latent with zeros.
+        self.da2_conditioning_enabled = bool(
+            self.cfg.get("da2_conditioning_enabled", True)
+        )
 
         # Validity-Guided Completion (VGC)
         # This is a mask-free sky-collapse regularizer: it does not use sky masks
@@ -139,11 +150,20 @@ class MarigoldTrainer:
             raise ValueError("VGC far_anchor_weight must be non-negative")
         if not 0.0 <= self.vgc_min_far_ratio <= 1.0:
             raise ValueError("VGC min_far_ratio must be in [0, 1]")
+        self.min_snr_enabled = bool(self.cfg.get("min_snr_enabled", True))
         self.min_snr_gamma = float(self.cfg.get("min_snr_gamma", 5.0))
-        if self.min_snr_gamma <= 0:
+        if self.min_snr_enabled and self.min_snr_gamma <= 0:
             raise ValueError("min_snr_gamma must be positive")
+        self.offset_noise_strength = float(
+            self.cfg.get("offset_noise_strength", 0.1)
+        )
+        if self.offset_noise_strength < 0:
+            raise ValueError("offset_noise_strength must be non-negative")
         schedule_cfg = self.cfg.get("diffusion_schedule", {})
         self.min_snr_floor = float(schedule_cfg.get("min_snr_floor", 0.0))
+        self.terminal_noise_alignment = bool(
+            schedule_cfg.get("terminal_noise_alignment", True)
+        )
         self.terminal_noise_fade_fraction = float(
             schedule_cfg.get("terminal_noise_fade_fraction", 0.1)
         )
@@ -317,11 +337,14 @@ class MarigoldTrainer:
                     device=device,
                     generator=rand_num_generator,
                 ).long()  # [B]
-                terminal_fade = terminal_noise_fade(
-                    timesteps,
-                    self.scheduler_timesteps,
-                    self.terminal_noise_fade_fraction,
-                )
+                if self.terminal_noise_alignment:
+                    terminal_fade = terminal_noise_fade(
+                        timesteps,
+                        self.scheduler_timesteps,
+                        self.terminal_noise_fade_fraction,
+                    )
+                else:
+                    terminal_fade = torch.ones_like(timesteps, dtype=torch.float32)
 
                 if self.apply_multi_res_noise:
                     strength = self.mr_noise_strength
@@ -347,7 +370,11 @@ class MarigoldTrainer:
                 # Multi-resolution noise is not a standard Gaussian at the last
                 # timestep. Match inference exactly at the pure-noise endpoint.
                 terminal = (timesteps == self.scheduler_timesteps - 1).view(-1, 1, 1, 1)
-                if self.apply_multi_res_noise and terminal.any():
+                if (
+                    self.terminal_noise_alignment
+                    and self.apply_multi_res_noise
+                    and terminal.any()
+                ):
                     standard_noise = torch.randn(
                         gt_depth_latent.shape,
                         device=device,
@@ -355,13 +382,13 @@ class MarigoldTrainer:
                     )
                     noise = torch.where(terminal, standard_noise, noise)
                 
-                offset_noise_strength = 0.1
-                offset_noise = torch.randn(
-                    batch_size, gt_depth_latent.shape[1], 1, 1, 
-                    device=device, 
-                    generator=rand_num_generator
-                ) * offset_noise_strength * terminal_fade.view(-1, 1, 1, 1)
-                noise = noise + offset_noise
+                if self.offset_noise_strength > 0:
+                    offset_noise = torch.randn(
+                        batch_size, gt_depth_latent.shape[1], 1, 1,
+                        device=device,
+                        generator=rand_num_generator,
+                    ) * self.offset_noise_strength * terminal_fade.view(-1, 1, 1, 1)
+                    noise = noise + offset_noise
 
                 # Add noise to the latents (diffusion forward process)
                 noisy_latents = self.training_noise_scheduler.add_noise(
@@ -374,8 +401,13 @@ class MarigoldTrainer:
                 )  # [B, 77, 1024]
 
                 # Concat rgb and depth latents
+                da2_condition_latent = (
+                    da2_depth_latent
+                    if self.da2_conditioning_enabled
+                    else torch.zeros_like(da2_depth_latent)
+                )
                 cat_latents = torch.cat(
-                    [rgb_latent, da2_depth_latent, noisy_latents], dim=1
+                    [rgb_latent, da2_condition_latent, noisy_latents], dim=1
                 )  # [B, 12, h, w]
                 cat_latents = cat_latents.float()
 
@@ -411,12 +443,15 @@ class MarigoldTrainer:
                     pred_x0 = model_pred # sample type
 
             
-                snr_weight = min_snr_weight(
-                    alpha_prod_t,
-                    self.prediction_type,
-                    self.min_snr_gamma,
-                    self.min_snr_floor,
-                )
+                if self.min_snr_enabled:
+                    snr_weight = min_snr_weight(
+                        alpha_prod_t,
+                        self.prediction_type,
+                        self.min_snr_gamma,
+                        self.min_snr_floor,
+                    )
+                else:
+                    snr_weight = torch.ones_like(alpha_prod_t)
 
                 diff = model_pred.float() - target.float()
                 if "l1" in self.cfg.loss.name.lower():
@@ -437,7 +472,10 @@ class MarigoldTrainer:
                     latent_loss = unreduced_loss
                     grad_loss = self.latent_grad_loss(pred_x0.float(), gt_depth_latent.float())
 
-                loss = latent_loss.mean() + 0.1 * grad_loss.mean()
+                loss = (
+                    latent_loss.mean()
+                    + self.latent_gradient_weight * grad_loss.mean()
+                )
                 vgc_loss = loss.new_zeros(())
 
                 if self.vgc_enabled:

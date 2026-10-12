@@ -1,4 +1,5 @@
 import importlib
+from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
 import unittest
@@ -91,7 +92,12 @@ class DiffusionTrainingTest(unittest.TestCase):
         self.assertEqual(cfg.diffusion_schedule.prediction_type, "v_prediction")
         self.assertTrue(cfg.diffusion_schedule.rescale_betas_zero_snr)
         self.assertEqual(cfg.diffusion_schedule.timestep_spacing, "trailing")
+        self.assertTrue(cfg.diffusion_schedule.terminal_noise_alignment)
         self.assertEqual(cfg.diffusion_schedule.terminal_noise_fade_fraction, .1)
+        self.assertTrue(cfg.min_snr_enabled)
+        self.assertEqual(cfg.offset_noise_strength, .1)
+        self.assertEqual(cfg.latent_gradient_weight, .1)
+        self.assertTrue(cfg.da2_conditioning_enabled)
         self.assertEqual(cfg.validity_guided_completion.smooth_weight, .005)
         self.assertEqual(cfg.validity_guided_completion.far_anchor_weight, .01)
         self.assertEqual(cfg.validity_guided_completion.far_depth_threshold, .5)
@@ -100,6 +106,51 @@ class DiffusionTrainingTest(unittest.TestCase):
         new = IterExponential(cfg.lr_scheduler.kwargs.total_iter, .01, cfg.lr_scheduler.kwargs.warmup_steps)
         for step in (1000, 10000, 23000):
             self.assertAlmostEqual(old(step), new(step))
+
+    def test_ablation_configs_change_only_declared_components(self):
+        config_dir = Path("config/ablation")
+        expected_files = {
+            "00_full.yaml",
+            "01_no_far_anchor.yaml",
+            "02_no_vgc.yaml",
+            "03_no_terminal_snr.yaml",
+            "04_no_min_snr.yaml",
+            "05_no_multi_res_noise.yaml",
+            "06_no_offset_noise.yaml",
+            "07_no_latent_gradient.yaml",
+            "08_no_da2_prior.yaml",
+        }
+        self.assertEqual(
+            {path.name for path in config_dir.glob("*.yaml")}, expected_files
+        )
+
+        configs = {
+            path.stem: recursive_load_config(str(path))
+            for path in config_dir.glob("*.yaml")
+        }
+        for cfg in configs.values():
+            self.assertEqual(cfg.max_iter, 23000)
+            self.assertEqual(cfg.dataloader.effective_batch_size, 42)
+            self.assertEqual(cfg.dataloader.seed, 2024)
+            self.assertEqual(cfg.diffusion_schedule.prediction_type, "v_prediction")
+
+        self.assertEqual(
+            configs["01_no_far_anchor"].validity_guided_completion.far_anchor_weight,
+            0,
+        )
+        self.assertFalse(configs["02_no_vgc"].validity_guided_completion.enabled)
+        terminal = configs["03_no_terminal_snr"].diffusion_schedule
+        self.assertFalse(terminal.rescale_betas_zero_snr)
+        self.assertEqual(terminal.timestep_spacing, "leading")
+        self.assertEqual(terminal.min_snr_floor, 0)
+        self.assertFalse(terminal.terminal_noise_alignment)
+        self.assertFalse(configs["04_no_min_snr"].min_snr_enabled)
+        self.assertIsNone(configs["05_no_multi_res_noise"].multi_res_noise)
+        self.assertEqual(configs["06_no_offset_noise"].offset_noise_strength, 0)
+        self.assertEqual(configs["07_no_latent_gradient"].latent_gradient_weight, 0)
+        no_da2 = configs["08_no_da2_prior"]
+        self.assertFalse(no_da2.da2_conditioning_enabled)
+        self.assertFalse(no_da2.validity_guided_completion.enabled)
 
     def test_real_trainer_updates_unet_with_accumulation(self):
         self._run_trainer()
