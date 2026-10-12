@@ -404,6 +404,8 @@ class MarigoldPipeline(DiffusionPipeline):
         """
         device = self.device
         rgb_in = rgb_in.to(device)
+        # rgb_in is ApDepth [-1, 1]. infer_batch performs DA2's required
+        # [0, 1] + ImageNet normalization and returns near=-1/far=+1 depth.
         da2_depth = self.da2.infer_batch(rgb_in).to(device)
 
         # Set timesteps
@@ -412,6 +414,8 @@ class MarigoldPipeline(DiffusionPipeline):
 
         # Encode image
         rgb_latent = self.encode_rgb(rgb_in)
+        # DA2 raw output is unbounded relative disparity; infer_batch maps it
+        # to the SD2 VAE's [-1, 1] image domain before this call.
         da2_depth_latent = self.encode_rgb(da2_depth)
 
         # Initial depth map (noise)

@@ -70,12 +70,12 @@ class LatentGradLoss(nn.Module):
         latent_grad_loss = 0.0
 
         if mask is not None:
-            mask_x = mask[..., :-1]
+            mask_x = mask[..., :-1] & mask[..., 1:]
 
-            mask_y = mask[:, :, :-1, :]
+            mask_y = mask[:, :, :-1, :] & mask[:, :, 1:, :]
 
-            latent_grad_loss += (grad_x_diff * mask_x).sum() / mask_x.sum()
-            latent_grad_loss += (grad_y_diff * mask_y).sum() / mask_y.sum()
+            latent_grad_loss += torch.where(mask_x, grad_x_diff, 0.0).sum() / mask_x.sum().clamp_min(1)
+            latent_grad_loss += torch.where(mask_y, grad_y_diff, 0.0).sum() / mask_y.sum().clamp_min(1)
         else:
             latent_grad_loss = grad_x_diff.mean() + grad_y_diff.mean()
 

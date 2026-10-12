@@ -1,0 +1,17 @@
+# Standalone decoder post-training; train.py does not consume this config.
+# Frozen VGC U-Net runs a complete 50-step DDIM once per cache sample.
+max_steps: 1000
+learning_rate: 1.0e-5
+warmup_steps: 50
+accumulation_steps: 4
+seed: 2024
+evaluate_every: 50
+save_every: 250
+max_grad_norm: 1.0
+erosion: 2
+sky_weight: 1.0
+preserve_weight: 5.0
+gradient_weight: 0.5
+# Held-out preservation limits in normalized [0,1] output units.
+max_non_sky_mae: 0.02
+max_non_sky_p95: 0.05

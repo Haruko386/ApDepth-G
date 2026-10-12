@@ -1,0 +1,6 @@
+base_config:
+- config/train_marigold.yaml
+
+# 保留原始 VGC，只移除修正 DA2 提供的远场区域均值锚点。
+validity_guided_completion:
+  far_anchor_weight: 0.0

@@ -1,0 +1,4 @@
+base_config:
+- config/train_marigold.yaml
+
+# 完整方法：与 config/train_marigold.yaml 完全一致，作为消融对照组。

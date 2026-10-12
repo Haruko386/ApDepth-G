@@ -9,6 +9,8 @@ base_config:
 # - config/dataset/dataset_vis.yaml
 - config/model_sdv2.yaml
 
+model:
+  pretrained_path: sd2-1
 
 pipeline:
   name: MarigoldPipeline
@@ -27,21 +29,22 @@ augmentation:
   lr_flip_p: 0.5
 
 dataloader:
-  num_workers: 2
-  effective_batch_size: 32
-  max_train_batch_size: 2
+  num_workers: 7
+  effective_batch_size: 42
+  max_train_batch_size: 7
   seed: 2024  # to ensure continuity when resuming from checkpoint
 
 # Training settings
 trainer:
   name: MarigoldTrainer
   training_noise_scheduler:
-    pretrained_path: stable-diffusion-2
+    pretrained_path: ${model.pretrained_path}
   init_seed: 2024  # use null to train w/o seeding
   save_period: 250
   backup_period: 2000
-  validation_period: 30000
-  visualization_period: 40000
+  # train.py currently does not construct validation/visualization loaders.
+  validation_period: 0
+  visualization_period: 0
 
 multi_res_noise:
   strength: 0.9
@@ -53,7 +56,7 @@ gt_mask_type: valid_mask_raw
 
 # 建议这个数字不要再动
 max_epoch: 10000  # a large enough number to ensure convergence
-max_iter: 23000 # usually converges at around 20k
+max_iter: 23000 # optimizer updates; effective batch 42 (7 x 6)
 
 optimizer:
   name: Adam
@@ -62,6 +65,40 @@ loss:
   name: mse_loss
   kwargs:
     reduction: mean
+
+min_snr_gamma: 5.0
+min_snr_enabled: true
+
+# Exposed explicitly so each training component can be disabled cleanly in
+# config/ablation without changing the full model's behavior.
+latent_gradient_weight: 0.1
+offset_noise_strength: 0.1
+da2_conditioning_enabled: true
+
+# Align the highest-noise training state with pure-noise DDIM inference.
+# v-prediction keeps x0 reconstruction finite at exactly zero terminal SNR;
+# the small floor prevents Min-SNR from discarding that endpoint entirely.
+diffusion_schedule:
+  prediction_type: v_prediction
+  rescale_betas_zero_snr: true
+  timestep_spacing: trailing
+  min_snr_floor: 0.05
+  terminal_noise_alignment: true
+  terminal_noise_fade_fraction: 0.10
+
+validity_guided_completion:
+  # Conservative DA2 weak supervision: region mean + smoothness on fully
+  # invalid latent cells only. Do not replace this with pixel-wise DA2 targets.
+  enabled: true
+  min_invalid_ratio: 0.08
+  anchor_weight: 0.02
+  smooth_weight: 0.005
+  # Extra region-level anchor only where GT is fully invalid and corrected DA2
+  # predicts far depth. This targets sky/far-field without copying DA2 pixels.
+  far_anchor_weight: 0.01
+  far_depth_threshold: 0.50  # corrected DA2 convention: -1 near, +1 far
+  min_far_ratio: 0.02
+  eps: 1.0e-6
 
 lr: 3.0e-05
 lr_scheduler:
