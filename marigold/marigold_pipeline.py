@@ -48,6 +48,7 @@ from .util.image_util import (
     resize_max_res,
 )
 from DA2.depth_anything_v2.dpt import DepthAnythingV2
+from src.util.da2_config import resolve_da2_config, da2_checkpoint_path
 
 class MarigoldDepthOutput(BaseOutput):
     """
@@ -121,6 +122,7 @@ class MarigoldPipeline(DiffusionPipeline):
         shift_invariant: Optional[bool] = True,
         default_denoising_steps: Optional[int] = None,
         default_processing_resolution: Optional[int] = None,
+        da2_config: Optional[dict] = None,
     ):
         super().__init__()
         self.register_modules(
@@ -144,18 +146,24 @@ class MarigoldPipeline(DiffusionPipeline):
 
         self.empty_text_embed = None
 
-        da2_config = {
-            'encoder':'vitg',
-            'features': 384,
-            'out_channels': [1536, 1536, 1536, 1536]
-        }
+        da2_config = resolve_da2_config(da2_config)
+        checkpoint_path = da2_checkpoint_path(da2_config)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"DA2 checkpoint not found: {checkpoint_path}. "
+                                    "Configure encoder/checkpoint in config/da2.yaml.")
+        self.register_to_config(da2_config=da2_config)
+        self.da2 = DepthAnythingV2(**{
+            key: da2_config[key] for key in ("encoder", "features", "out_channels")
+        })
+        self.da2.load_state_dict(torch.load(checkpoint_path, map_location="cpu", weights_only=True))
+        self.da2.requires_grad_(False).eval()
 
-        if da2_config is not None:
-            self.da2 = DepthAnythingV2(**da2_config)
-            self.da2.load_state_dict(torch.load(f'DA2/checkpoints/depth_anything_v2_{da2_config["encoder"]}.pth', map_location='cpu'))
-            self.da2.to(device="cuda")
-        else:
-            self.da2 = None
+    def to(self, *args, **kwargs):
+        pipeline = super().to(*args, **kwargs)
+        # DA2 is an external frozen prior, not a serialized Diffusers component.
+        # Keep its original fp32 precision while following the pipeline device.
+        self.da2.to(device=self.device)
+        return pipeline
 
     @torch.no_grad()
     def __call__(

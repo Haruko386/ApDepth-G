@@ -155,7 +155,7 @@ class DiffusionTrainingTest(unittest.TestCase):
     def test_real_trainer_updates_unet_with_accumulation(self):
         self._run_trainer()
 
-    def _run_trainer(self):
+    def _run_trainer(self, mixed=False):
         # External DA2 code/weights are not in this checkout. Stub only its import;
         # execute the actual trainer loop with small differentiable modules.
         fake_da2 = ModuleType("DA2.depth_anything_v2.dpt")
@@ -220,6 +220,26 @@ class DiffusionTrainingTest(unittest.TestCase):
             loader = torch.utils.data.DataLoader(
                 [{key: value[0] for key, value in batch.items()}] * 2, batch_size=1
             )
+            if mixed:
+                from src.dataset.mixed_sampler import MixedBatchSampler
+
+                class NamedDataset(list):
+                    pass
+
+                datasets = []
+                for name in ("hypersim_train", "vkitti_train"):
+                    samples = NamedDataset([{**{k: v[0] for k, v in batch.items()},
+                                             "dataset_name": name}])
+                    samples.disp_name = name
+                    datasets.append(samples)
+                sampler = MixedBatchSampler(
+                    datasets, 1, True, False, prob=[.9, .1],
+                    probability_schedule=cfg.dataset.train.probability_schedule,
+                    total_steps=cfg.max_iter, accumulation_steps=2,
+                )
+                loader = torch.utils.data.DataLoader(
+                    torch.utils.data.ConcatDataset(datasets), batch_sampler=sampler,
+                )
             trainer = trainer_module.MarigoldTrainer(cfg, pipeline, loader, "cpu", ".", ".", ".", ".", 2)
             self.assertEqual(trainer.prediction_type, "v_prediction")
             self.assertEqual(trainer.training_noise_scheduler.alphas_cumprod[-1].item(), 0)
@@ -249,6 +269,12 @@ class DiffusionTrainingTest(unittest.TestCase):
             trainer._validity_guided_completion_loss = capture_vgc_mask
             trainer.save_checkpoint = MagicMock()
             trainer.train()
+            if mixed:
+                logs = [call.args[0] for call in trainer_module.tb_logger.log_dic.call_args_list]
+                sampling = next(log for log in logs if "train_sampling/probability/vkitti_train" in log)
+                self.assertAlmostEqual(sampling["train_sampling/probability/vkitti_train"], .1)
+                observed = [v for k, v in sampling.items() if "/observed_ratio/" in k]
+                self.assertAlmostEqual(sum(observed), 1.)
         self.assertEqual(trainer.effective_iter, 1)
         self.assertEqual(trainer.n_batch_in_epoch, 2)
         self.assertFalse(torch.equal(before, pipeline.unet.conv_in.weight))
@@ -262,6 +288,9 @@ class DiffusionTrainingTest(unittest.TestCase):
         self.assertFalse(
             (captured_far_masks[0] & ~captured_invalid_masks[0]).any()
         )
+
+    def test_real_trainer_with_dynamic_mixed_sampler(self):
+        self._run_trainer(mixed=True)
 
 
 if __name__ == "__main__":

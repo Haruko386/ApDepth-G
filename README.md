@@ -180,7 +180,7 @@ python train.py \
   --config config/train_marigold.yaml \
   --base_data_dir "${BASE_DATA_DIR}" \
   --base_ckpt_dir "${BASE_CKPT_DIR}" \
-  --output_dir output/unet_terminal_snr_v1 \
+  --output_dir output/unet_dynamic_mix_v1 \
   --no_wandb
 ```
 
@@ -188,7 +188,7 @@ Resume only the matching run:
 
 ```bash
 python train.py \
-  --resume_run output/unet_terminal_snr_v1/train_marigold/checkpoint/latest \
+  --resume_run output/unet_dynamic_mix_v1/train_marigold/checkpoint/latest \
   --base_data_dir "${BASE_DATA_DIR}" \
   --base_ckpt_dir "${BASE_CKPT_DIR}" \
   --no_wandb
@@ -200,7 +200,7 @@ and pass the checkpoint parent directory at inference:
 ```bash
 python run.py \
   --checkpoint "${BASE_CKPT_DIR}/sd2-1" \
-  --unet_checkpoint output/unet_terminal_snr_v1/train_marigold/checkpoint/iter_023000 \
+  --unet_checkpoint output/unet_dynamic_mix_v1/train_marigold/checkpoint/iter_008000 \
   --input_rgb_dir output/out \
   --output_dir output/unet_terminal_snr_eval \
   --denoise_steps 50 --ensemble_size 1 --processing_res 768 --seed 2024
@@ -209,11 +209,97 @@ python run.py \
 Only the U-Net is optimized. The scheduler is configuration state saved to keep
 training and multi-step inference mathematically consistent.
 
+### Progressive dataset sampling
+
+Set the initial and final sampling probabilities in
+`config/dataset/dataset_train.yaml`, following the order of `dataset_list`
+(Hypersim, Virtual KITTI):
+
+```yaml
+dataset:
+  train:
+    prob_ls: [0.9, 0.1]
+    probability_schedule:
+      enabled: true
+      start_fraction: 0.2
+      end_fraction: 0.8
+      final_prob_ls: [0.8, 0.2]
+```
+
+The default schedule spans `max_iter: 23000` **optimizer updates**. It keeps the
+90%/10% mixture for the first 20% of training, linearly changes it to 80%/20%
+during the middle 60%, and holds 80%/20% for the final 20%. After 4,600, 11,500,
+and 18,400 completed updates, the VKITTI probability for the next update is
+10%, 15%, and 20%, respectively. Each microbatch comes from one dataset. These
+values are sampling probabilities rather than required sample quotas per update.
+This configuration does not change the learning rate, loss weights, or total
+number of training updates.
+
+Set `enabled: false` to use fixed probabilities. Legacy configurations without
+`probability_schedule` also retain fixed sampling. For a fixed 15% VKITTI control,
+set `prob_ls: [0.85, 0.15]` and disable the schedule. Its VKITTI probability is
+approximately equal to the default schedule's average over the full run, allowing
+the effects of total dataset exposure and training order to be compared.
+
+In TensorBoard, `train_sampling/probability/<dataset>` records the target
+probability used for each optimizer update, while
+`train_sampling/observed_ratio/<dataset>` records the proportion of samples
+actually consumed in that update. The observed ratio fluctuates with random
+sampling; use smoothing to inspect its trend. The schedule uses each batch's
+logical training position so that worker prefetching does not advance it early.
+It also supports gradient accumulation across epoch boundaries.
+
+`--resume_run` reads `config.yaml` from the original run directory and restores
+the global schedule position using the checkpoint's `effective_iter` and
+`n_batch_in_epoch`, rather than restarting at 10%. Editing the repository's
+configuration does not automatically change an existing run. Runs without a
+schedule configuration continue with fixed probabilities. Restoring schedule
+progress does not guarantee bitwise reproducibility of the entire training run.
+Use a new output directory for a new control experiment, and keep `max_iter` and
+the effective batch size unchanged when resuming.
+
+### Standalone DA2 configuration
+
+`config/da2.yaml` defines the DA2 encoder, its architecture parameters, and the
+checkpoint path. The default encoder is `vitg`. The main training configuration
+includes this file through `base_config`.
+
+```yaml
+da2:
+  encoder: vitg  # Choices: vits / vitb / vitl / vitg
+  checkpoint: null
+  # Keep the four architecture profiles supplied under model_configs.
+```
+
+Change `encoder` to select another architecture profile. With `checkpoint: null`,
+the checkpoint path is `DA2/checkpoints/depth_anything_v2_<encoder>.pth`.
+You can also specify a custom path. Relative checkpoint paths are resolved from
+the repository root; absolute paths are used directly. The weights must match
+the selected encoder. DA2 remains frozen, in evaluation mode and FP32, and follows
+the pipeline's execution device.
+
+Both `run.py` and `infer.py` accept `--da2_config`. For example:
+
+```bash
+python run.py \
+  --checkpoint "${BASE_CKPT_DIR}/sd2-1" \
+  --unet_checkpoint output/unet_dynamic_mix_v1/train_marigold/checkpoint/iter_008000 \
+  --da2_config output/unet_dynamic_mix_v1/train_marigold/config.yaml \
+  --input_rgb_dir input/in-the-wild_example \
+  --output_dir output/dynamic_mix_eval \
+  --denoise_steps 50 --ensemble_size 1 --seed 2024
+```
+
+Pass the training run's saved `config.yaml` to reuse its DA2 settings. If this
+argument is omitted, the DA2 configuration saved in a complete pipeline takes
+precedence. Legacy models without that configuration use the repository's
+`config/da2.yaml`. A U-Net checkpoint does not include DA2 weights; use the same
+DA2 encoder and weights for training and inference. These settings do not change
+DA2 input normalization or the conversion to the project's depth range.
+
 > [!IMPORTANT]
 >
 > Although random seeds have been set, the training result might be slightly different on different hardwares. It's recommended to train without interruption.
-
-
 
 ## ✏️ Contributing
 
