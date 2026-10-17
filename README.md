@@ -236,10 +236,8 @@ This configuration does not change the learning rate, loss weights, or total
 number of training updates.
 
 Set `enabled: false` to use fixed probabilities. Legacy configurations without
-`probability_schedule` also retain fixed sampling. For a fixed 15% VKITTI control,
-set `prob_ls: [0.85, 0.15]` and disable the schedule. Its VKITTI probability is
-approximately equal to the default schedule's average over the full run, allowing
-the effects of total dataset exposure and training order to be compared.
+`probability_schedule` also retain fixed sampling. The paper's ablations all use
+the default progressive schedule.
 
 In TensorBoard, `train_sampling/probability/<dataset>` records the target
 probability used for each optimizer update, while
@@ -296,6 +294,19 @@ precedence. Legacy models without that configuration use the repository's
 `config/da2.yaml`. A U-Net checkpoint does not include DA2 weights; use the same
 DA2 encoder and weights for training and inference. These settings do not change
 DA2 input normalization or the conversion to the project's depth range.
+
+### Paper ablations and evaluation
+
+The [ablation guide](config/ablation/README.md) maps all eleven configurations to
+the paper tables and provides training and evaluation commands. All ablations
+share progressive sampling and are evaluated on NYUv2 and KITTI. Only the full
+model is additionally evaluated on ETH3D, ScanNet, and DIODE for the main table.
+`script/eval_ablations.py` runs this plan and exports paper-scale metrics to CSV.
+
+New checkpoints include `inference_settings.json`, which restores DA2 settings
+and the conditioning switch automatically during inference. Existing checkpoints
+can use their original run's `config.yaml`. Keep the matching `scheduler/` with
+each checkpoint, including the terminal-alignment ablation's own scheduler.
 
 > [!IMPORTANT]
 >

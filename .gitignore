@@ -1,4 +1,6 @@
 output/
+tmp/
+indent.log
 
 __pycache__/
 *.py[cod]

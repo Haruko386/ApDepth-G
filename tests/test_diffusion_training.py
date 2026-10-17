@@ -119,6 +119,8 @@ class DiffusionTrainingTest(unittest.TestCase):
             "06_no_offset_noise.yaml",
             "07_no_latent_gradient.yaml",
             "08_no_da2_prior.yaml",
+            "09_no_region_anchor.yaml",
+            "10_no_interior_smoothness.yaml",
         }
         self.assertEqual(
             {path.name for path in config_dir.glob("*.yaml")}, expected_files
@@ -151,6 +153,46 @@ class DiffusionTrainingTest(unittest.TestCase):
         no_da2 = configs["08_no_da2_prior"]
         self.assertFalse(no_da2.da2_conditioning_enabled)
         self.assertFalse(no_da2.validity_guided_completion.enabled)
+        self.assertEqual(configs["09_no_region_anchor"].validity_guided_completion.anchor_weight, 0)
+        self.assertEqual(configs["10_no_interior_smoothness"].validity_guided_completion.smooth_weight, 0)
+
+        # Compare all resolved leaves so an accidental change in an inherited
+        # setting cannot silently confound a one-component ablation.
+        from omegaconf import OmegaConf
+
+        def leaves(cfg, prefix=""):
+            result = {}
+            for key, value in cfg.items():
+                if key == "base_config":
+                    continue
+                path = f"{prefix}.{key}" if prefix else key
+                if isinstance(value, dict):
+                    result.update(leaves(value, path))
+                else:
+                    result[path] = value
+            return result
+
+        expected = {
+            "00_full": set(),
+            "01_no_far_anchor": {"validity_guided_completion.far_anchor_weight"},
+            "02_no_vgc": {"validity_guided_completion.enabled"},
+            "03_no_terminal_snr": {f"diffusion_schedule.{key}" for key in (
+                "rescale_betas_zero_snr", "timestep_spacing", "min_snr_floor", "terminal_noise_alignment")},
+            "04_no_min_snr": {"min_snr_enabled"},
+            "05_no_multi_res_noise": {"multi_res_noise", "multi_res_noise.strength",
+                                       "multi_res_noise.annealed", "multi_res_noise.downscale_strategy"},
+            "06_no_offset_noise": {"offset_noise_strength"},
+            "07_no_latent_gradient": {"latent_gradient_weight"},
+            "08_no_da2_prior": {"da2_conditioning_enabled", "validity_guided_completion.enabled"},
+            "09_no_region_anchor": {"validity_guided_completion.anchor_weight"},
+            "10_no_interior_smoothness": {"validity_guided_completion.smooth_weight"},
+        }
+        base = leaves(OmegaConf.to_container(configs["00_full"], resolve=True))
+        for name, cfg in configs.items():
+            current = leaves(OmegaConf.to_container(cfg, resolve=True))
+            changed = {key for key in base.keys() | current.keys()
+                       if key not in base or key not in current or base[key] != current[key]}
+            self.assertEqual(changed, expected[name], name)
 
     def test_real_trainer_updates_unet_with_accumulation(self):
         self._run_trainer()

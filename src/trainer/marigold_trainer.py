@@ -21,6 +21,7 @@
 
 
 import logging
+import json
 import os
 import shutil
 from datetime import datetime
@@ -129,6 +130,7 @@ class MarigoldTrainer:
         self.da2_conditioning_enabled = bool(
             self.cfg.get("da2_conditioning_enabled", True)
         )
+        self.model.da2_conditioning_enabled = self.da2_conditioning_enabled
 
         # Validity-Guided Completion (VGC)
         # This is a mask-free sky-collapse regularizer: it does not use sky masks
@@ -903,6 +905,17 @@ class MarigoldTrainer:
         scheduler_path = os.path.join(ckpt_dir, "scheduler")
         self.model.scheduler.save_pretrained(scheduler_path)
         logging.info(f"Inference scheduler is saved to: {scheduler_path}")
+
+        # Store inference-relevant ablation switches beside every checkpoint,
+        # including final checkpoints that do not contain trainer.ckpt.
+        settings = {
+            "da2_conditioning_enabled": self.da2_conditioning_enabled,
+            "da2_config": OmegaConf.to_container(self.cfg.da2, resolve=True)
+            if self.cfg.get("da2") is not None else None,
+            "diffusion_schedule": OmegaConf.to_container(self.cfg.diffusion_schedule, resolve=True),
+        }
+        with open(os.path.join(ckpt_dir, "inference_settings.json"), "w", encoding="utf-8") as handle:
+            json.dump(settings, handle, indent=2)
 
         if save_train_state:
             state = {

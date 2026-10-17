@@ -35,8 +35,7 @@ from marigold import MarigoldPipeline
 EXTENSION_LIST = [".jpg", ".jpeg", ".png"]
 
 from torchvision import transforms
-from src.util.model_overrides import apply_model_overrides
-from src.util.da2_config import load_da2_config
+from src.util.model_overrides import apply_model_overrides, checkpoint_pipeline_kwargs
 
 
 if "__main__" == __name__:
@@ -212,7 +211,7 @@ if "__main__" == __name__:
 
     pipe: MarigoldPipeline = MarigoldPipeline.from_pretrained(
         checkpoint_path, variant=variant, torch_dtype=dtype,
-        **({"da2_config": load_da2_config(args.da2_config)} if args.da2_config else {}),
+        **checkpoint_pipeline_kwargs(args.unet_checkpoint, args.da2_config),
     )
     apply_model_overrides(pipe, args.unet_checkpoint)
     # unet = UNet2DConditionModel.from_pretrained(os.path.join(checkpoint_path, f'unet'))

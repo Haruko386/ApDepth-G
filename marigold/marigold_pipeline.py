@@ -123,6 +123,7 @@ class MarigoldPipeline(DiffusionPipeline):
         default_denoising_steps: Optional[int] = None,
         default_processing_resolution: Optional[int] = None,
         da2_config: Optional[dict] = None,
+        da2_conditioning_enabled: bool = True,
     ):
         super().__init__()
         self.register_modules(
@@ -137,6 +138,7 @@ class MarigoldPipeline(DiffusionPipeline):
             shift_invariant=shift_invariant,
             default_denoising_steps=default_denoising_steps,
             default_processing_resolution=default_processing_resolution,
+            da2_conditioning_enabled=da2_conditioning_enabled,
         )
 
         self.scale_invariant = scale_invariant
@@ -145,6 +147,7 @@ class MarigoldPipeline(DiffusionPipeline):
         self.default_processing_resolution = default_processing_resolution
 
         self.empty_text_embed = None
+        self.da2_conditioning_enabled = da2_conditioning_enabled
 
         da2_config = resolve_da2_config(da2_config)
         checkpoint_path = da2_checkpoint_path(da2_config)
@@ -414,7 +417,6 @@ class MarigoldPipeline(DiffusionPipeline):
         rgb_in = rgb_in.to(device)
         # rgb_in is ApDepth [-1, 1]. infer_batch performs DA2's required
         # [0, 1] + ImageNet normalization and returns near=-1/far=+1 depth.
-        da2_depth = self.da2.infer_batch(rgb_in).to(device)
 
         # Set timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -424,7 +426,11 @@ class MarigoldPipeline(DiffusionPipeline):
         rgb_latent = self.encode_rgb(rgb_in)
         # DA2 raw output is unbounded relative disparity; infer_batch maps it
         # to the SD2 VAE's [-1, 1] image domain before this call.
-        da2_depth_latent = self.encode_rgb(da2_depth)
+        if self.da2_conditioning_enabled:
+            da2_depth = self.da2.infer_batch(rgb_in).to(device)
+            da2_depth_latent = self.encode_rgb(da2_depth)
+        else:
+            da2_depth_latent = torch.zeros_like(rgb_latent)
 
         # Initial depth map (noise)
         depth_latent = torch.randn(

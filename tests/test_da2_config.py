@@ -92,6 +92,27 @@ class DA2ConfigTest(unittest.TestCase):
             loaded = module.MarigoldPipeline.from_pretrained(directory, **pipe.components)
             self.assertEqual(dict(loaded.config.da2_config), dict(pipe.config.da2_config))
             self.assertEqual(loaded.da2.architecture, pipe.da2.architecture)
+            # Exercise actual denoising input construction, not just config flags.
+            pipe.da2.infer_batch = unittest.mock.MagicMock(return_value=torch.ones(1, 3, 8, 8))
+            pipe.empty_text_embed = torch.zeros(1, 1, 8)
+            captured = []
+
+            def predict(sample, *args, **kwargs):
+                captured.append(sample[:, 4:8].detach().clone())
+                return type("Prediction", (), {"sample": torch.zeros_like(sample[:, :4])})()
+
+            with patch.object(pipe, "encode_rgb", side_effect=lambda x: x.mean(1, keepdim=True).repeat(1, 4, 1, 1)), \
+                    patch.object(pipe, "decode_depth", return_value=torch.zeros(1, 1, 8, 8)), \
+                    patch.object(pipe.unet, "forward", side_effect=predict):
+                for enabled in (False, True):
+                    pipe.da2_conditioning_enabled = enabled
+                    captured.clear()
+                    pipe.da2.infer_batch.reset_mock()
+                    pipe.single_infer(torch.zeros(1, 3, 8, 8), num_inference_steps=2,
+                                      show_pbar=False, generator=None)
+                    for prior_channels in captured:
+                        torch.testing.assert_close(prior_channels, torch.full_like(prior_channels, float(enabled)))
+                    self.assertEqual(pipe.da2.infer_batch.call_count, int(enabled))
 
 
 if __name__ == "__main__":

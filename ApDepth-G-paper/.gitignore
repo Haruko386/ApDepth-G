@@ -1,0 +1,24 @@
+# Track the manuscript and only the assets referenced by it.
+/*
+!/.gitignore
+!/README.md
+!/IEEEtran.cls
+!/IEEEtran.bst
+!/ieee-dc-template.tex
+!/ieee-dc-template.bib
+!/ieee-dc-template.pdf
+!/chart/
+/chart/*
+!/chart/main_results.tex
+!/chart/ablation_sky.tex
+!/chart/ablation_training.tex
+!/pdf/
+/pdf/*
+!/pdf/sky-collapse-multi-method.pdf
+!/pdf/invalid_region_img.pdf
+!/pdf/frame.pdf
+!/pdf/VGC.png
+!/pdf/UV_SHOWN.png
+!/img/
+/img/*
+!/img/banner-hor.png

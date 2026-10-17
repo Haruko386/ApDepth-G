@@ -32,8 +32,7 @@ from tqdm.auto import tqdm
 
 from marigold import MarigoldPipeline
 from src.util.seeding import seed_all
-from src.util.model_overrides import apply_model_overrides
-from src.util.da2_config import load_da2_config
+from src.util.model_overrides import apply_model_overrides, checkpoint_pipeline_kwargs
 from src.dataset import (
     BaseDepthDataset,
     DatasetMode,
@@ -211,7 +210,7 @@ if "__main__" == __name__:
 
     pipe = MarigoldPipeline.from_pretrained(
         checkpoint_path, variant=variant, torch_dtype=dtype,
-        **({"da2_config": load_da2_config(args.da2_config)} if args.da2_config else {}),
+        **checkpoint_pipeline_kwargs(args.unet_checkpoint, args.da2_config),
     )
     apply_model_overrides(pipe, args.unet_checkpoint)
     # unet = UNet2DConditionModel.from_pretrained(os.path.join(checkpoint_path, f'unet'))

@@ -13,7 +13,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base_checkpoint", required=True, help="SD2/pipeline directory used in training")
     parser.add_argument("--unet_checkpoint", required=True, help="Training checkpoint containing unet/")
-    parser.add_argument("--decoder_checkpoint", help="Optional calibrated decoder directory containing vae/")
     parser.add_argument("--image", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--steps", type=int, default=50)
@@ -29,7 +28,7 @@ def main():
     # Lazy import keeps --help usable without the external DA2 package.
     from diffusers import DDIMScheduler
     from marigold import MarigoldPipeline
-    from src.util.model_overrides import apply_model_overrides
+    from src.util.model_overrides import apply_model_overrides, checkpoint_pipeline_kwargs
     from marigold.util.image_util import colorize_depth_maps, chw2hwc
 
     destination = Path(args.output_dir)
@@ -40,8 +39,11 @@ def main():
         sky_mask = Image.open(args.sky_mask).convert("L")
         if sky_mask.size != rgb.size:
             raise ValueError("Sky mask must be registered to the original RGB image")
-    pipe = MarigoldPipeline.from_pretrained(args.base_checkpoint, torch_dtype=torch.float32)
-    apply_model_overrides(pipe, args.unet_checkpoint, args.decoder_checkpoint)
+    pipe = MarigoldPipeline.from_pretrained(
+        args.base_checkpoint, torch_dtype=torch.float32,
+        **checkpoint_pipeline_kwargs(args.unet_checkpoint),
+    )
+    apply_model_overrides(pipe, args.unet_checkpoint)
     if not isinstance(pipe.scheduler, DDIMScheduler):
         raise ValueError("This diagnostic requires the multi-step DDIM model")
     pipe.to(args.device)
