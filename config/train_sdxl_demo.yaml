@@ -21,7 +21,7 @@ dataloader:
 trainer:
   use_xformers: false # PyTorch SDPA (Diffusers default attention processor)
   gradient_checkpointing: true
-  mixed_precision: bf16
+  mixed_precision: "no" # FP32 by default; train.py --fp16 explicitly enables AMP
   report_cuda_memory: true
   check_finite_loss: true
 

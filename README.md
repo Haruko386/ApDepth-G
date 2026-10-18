@@ -28,7 +28,9 @@ Run every command below from the repository root.
 
 Only the U-Net is optimized. SDXL keeps the 12-channel RGB/DA2/noisy-depth input,
 FP32 VAE, cached dual-CLIP empty prompt, actual-canvas size conditioning,
-BF16 autocast, gradient checkpointing, PyTorch SDPA and Adam8bit.
+FP32 training by default, optional FP16 AMP, gradient checkpointing, PyTorch
+SDPA and Adam8bit. Adam8bit concerns optimizer-state storage; it does not
+implicitly switch model computation to FP16.
 The removed `residual_snr` and decoder-calibration experiments are not part of
 current main training. See [the migration/validation notes](doc/sdxl_demo.md).
 
@@ -50,7 +52,7 @@ conda create -n apdepth-sdxl --clone marigold
 conda activate apdepth-sdxl
 python -m pip install -r requirements-sdxl.txt
 python -m pip check
-python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_bf16_supported())"
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 python -m bitsandbytes
 ```
 
@@ -58,8 +60,8 @@ Replace `marigold` with your existing environment name. For a fresh environment,
 install a matching CUDA PyTorch/torchvision pair first, then `requirements-sdxl.txt`.
 The SDXL requirements include the runtime packages and do not pin or replace your
 CUDA PyTorch build deliberately. No xformers installation is required for SDXL.
-The memory configuration requires a BF16-capable GPU; measure its peak with the
-probe below before full training.
+Measure the memory peak with the probe below in the same precision as your
+planned training run. FP32 generally requires more activation memory than FP16.
 
 ```bash
 export BASE_DATA_DIR=/root/Dataset
@@ -107,6 +109,9 @@ python train.py \
   --output_dir output/sdxl_probe_v2 --no_wandb
 ```
 
+The probe defaults to FP32. For an FP16 run, add `--fp16` to both the probe and
+training commands, and use a separate probe output directory.
+
 Check successful exit and `effective_iter: 2` in
 `output/sdxl_probe_v2/train_sdxl_probe/memory_profile.json`.
 The probe measures both training shapes after optimizer states are allocated;
@@ -121,6 +126,22 @@ python train.py \
   --base_data_dir "${BASE_DATA_DIR}" --base_ckpt_dir "${BASE_CKPT_DIR}" \
   --output_dir output/sdxl_main_v2 --no_wandb
 ```
+
+Training defaults to **FP32**, with no BF16/FP16 autocast. To explicitly select
+FP16 AMP, add `--fp16` (alias `--half_precision`):
+
+```bash
+python train.py \
+  --config config/train_sdxl_demo.yaml --fp16 \
+  --base_data_dir "${BASE_DATA_DIR}" --base_ckpt_dir "${BASE_CKPT_DIR}" \
+  --output_dir output/sdxl_main_fp16 --no_wandb
+```
+
+FP16 training uses autocast and GradScaler; U-Net master weights, losses, the
+SDXL VAE and frozen DA2 remain FP32. A gradient overflow lowers the scale and
+replays the same accumulated batch with the same diffusion seeds, so iteration,
+LR and dataset sampling progress advance only after a successful update.
+Only CPU input batches are retained for a retry, not their GPU activations.
 
 The config filename is retained for compatibility. This is full U-Net training:
 23,000 optimizer updates, microbatch 1, accumulation 42, effective batch 42,
@@ -142,6 +163,12 @@ python train.py \
   --resume_run output/sdxl_main_v2/train_sdxl_demo/checkpoint/latest \
   --base_data_dir "${BASE_DATA_DIR}" --base_ckpt_dir "${BASE_CKPT_DIR}" --no_wandb
 ```
+
+For FP16 resume, also pass `--fp16`. Without it, resume runs in FP32 even if the
+saved config selected FP16 or BF16. The CLI precision choice overrides saved
+configuration; the active mode is logged and stored in subsequent trainer
+checkpoints. FP16 restores GradScaler state when available (older checkpoints
+without it initialize a new scaler).
 
 Resume loads that run's saved `config.yaml`, optimizer state and schedule
 position; editing repository YAML does not update an existing run. Do not reuse
@@ -256,7 +283,7 @@ Every ablation keeps its own saved scheduler and inference switches, including
 Offline CPU tests use real tiny SDXL U-Net, dual CLIP and VAE components, with
 a synthetic DA2 prior. They check configuration parity, training/backpropagation,
 resume, scheduler/DA2 restoration, multi-step inference and dataset commands.
-Full SDXL weights, BF16/Adam8bit CUDA execution and depth quality must still be
+Full SDXL weights, FP16/Adam8bit CUDA execution and depth quality must still be
 validated on the server; CPU tests cannot establish those results.
 
 ```bash

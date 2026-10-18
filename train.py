@@ -77,6 +77,8 @@ if "__main__" == __name__:
         "--output_dir", type=str, default=None, help="directory to save checkpoints"
     )
     parser.add_argument("--no_cuda", action="store_true", help="Do not use cuda.")
+    parser.add_argument("--fp16", "--half_precision", action="store_true",
+                        help="Enable FP16 AMP training; default is FP32, including resume.")
     parser.add_argument(
         "--exit_after",
         type=int,
@@ -148,6 +150,9 @@ if "__main__" == __name__:
             out_dir_run = os.path.join("./output", job_name)
         os.makedirs(out_dir_run, exist_ok=False)
 
+    # Precision is an explicit invocation choice, also when resuming. Never
+    # silently inherit FP16/BF16 from an older saved run configuration.
+    cfg.trainer.mixed_precision = "fp16" if args.fp16 else "no"
     cfg_data = cfg.dataset
 
     # Other directories

@@ -29,22 +29,28 @@ work and supervision-coverage scripts are not part of this migration.
 - Two CLIP hidden-state embeddings plus pooled text and actual-canvas time IDs.
   Empty prompt embeddings are cached on CPU; text encoders are released.
 - VAE scaling read from its config (official base: 0.13025), FP32 VAE and DA2.
-- FP32 U-Net parameters, BF16 autocast, gradient checkpointing, SDPA, Adam8bit.
+- Default FP32 computation and U-Net parameters, explicit FP16 AMP with GradScaler,
+  gradient checkpointing, SDPA and Adam8bit.
 - Effective batch 42 with microbatch 1; LR 1e-5, 23,000 optimizer updates.
 - Fixed two-dataset GPU memory probe in `config/train_sdxl_probe.yaml`.
 - Backbone mismatch detection when applying a U-Net checkpoint.
 
 ## Verification scope
 
-Local validation on 2026-10-18: **37 tests and 6 subtests passed**. The `--help`
+Local validation on 2026-10-18: **39 tests and 6 subtests passed**. The `--help`
 entry points for training, image inference, dataset inference, evaluation and
 both evaluation runners also passed. CPU test runtime: PyTorch 2.4.1,
 Diffusers 0.35.2, Transformers 4.57.0 and Accelerate 1.10.1.
 The real image/dataset CLI tests generate depth arrays using tiny SDXL weights;
 the evaluation CLI test reads synthetic NYUv2 GT and writes metrics JSON.
 Metric reset also supports pandas copy-on-write (tested with pandas 3.0.6).
-Inference defaults to FP32; explicit FP16 loads ordinary checkpoint files and
-keeps the SDXL VAE in FP32. This is separate from training's BF16 autocast setting.
+Both training and inference default to FP32, including training resume.
+`--fp16` / `--half_precision` explicitly enables FP16. Inference casts ordinary
+checkpoint weights; training uses autocast with FP32 master weights and a saved
+GradScaler. The SDXL VAE and DA2 remain FP32. Overflow retries reuse the same
+accumulated CPU batches and diffusion seeds before advancing training progress.
+CPU tests exercise FP16 autocast, scaler checkpoint restore and overflow replay;
+CUDA validation is still required.
 
 Tests use real small Diffusers SDXL U-Net, two CLIP encoders and an 8x VAE, with
 a synthetic frozen DA2 prior instead of external weights. They cover conditioning,
@@ -54,7 +60,7 @@ Shared tests cover conservative validity masks, far-region loss, noise alignment
 dynamic sampling across accumulation/epoch boundaries and schedule position after
 resume. Dataset CLI tests check command forwarding and evaluation on synthetic GT.
 
-Full SDXL/DA2 weights and datasets are not present locally. BF16 CUDA, Adam8bit
+Full SDXL/DA2 weights and datasets are not present locally. FP16 CUDA, Adam8bit
 CUDA kernels, full-resolution peak memory, runtime and accuracy still require
 server validation. Run the GPU probe in the README first, then start a new run.
 The probe uses both shapes after optimizer allocation, but does not establish the

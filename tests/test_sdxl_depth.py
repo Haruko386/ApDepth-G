@@ -154,12 +154,20 @@ class SDXLDepthTest(unittest.TestCase):
             self.assertEqual(half.vae.dtype, torch.float32)
 
     def test_checkpointing_training_resume_and_inference_override(self):
+        self._run_checkpoint_test()
+
+    def test_fp16_accumulation_and_scaler_resume_on_cpu(self):
+        # Run the same AMP/scaler logic using CPU FP16 kernels. This exercises
+        # the code path, not CUDA or bitsandbytes performance/compatibility.
+        self._run_checkpoint_test(fp16=True)
+
+    def _run_checkpoint_test(self, fp16=False):
         from src.trainer import marigold_trainer as trainer_module
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             cfg = recursive_load_config("config/train_sdxl_demo.yaml")
             # Exercise real SDXL conditions and activation checkpointing on CPU;
-            # CUDA BF16 and bitsandbytes are separately covered by the GPU probe.
+            # CUDA FP16 and bitsandbytes require the separate server GPU probe.
             cfg.trainer.mixed_precision = "no"
             cfg.trainer.report_cuda_memory = False
             cfg.optimizer.name = "Adam"
@@ -176,9 +184,21 @@ class SDXLDepthTest(unittest.TestCase):
             before = pipe.unet.conv_out.weight.detach().clone()
             vae_before = pipe.vae.encoder.conv_in.weight.detach().clone()
             (root / "ckpt").mkdir()
-            with patch.object(trainer_module.DDPMScheduler, "from_pretrained", return_value=scheduler), \
+            real_autocast = torch.autocast
+
+            def cpu_autocast(device_type, **kwargs):
+                return real_autocast("cpu" if device_type == "cuda" else device_type, **kwargs)
+
+            def setup_cpu_precision(trainer):
+                if fp16:
+                    trainer.use_fp16 = True
+                    trainer.scaler = torch.amp.GradScaler("cpu", init_scale=128)
+
+            with patch.object(torch, "autocast", side_effect=cpu_autocast), \
+                    patch.object(trainer_module.DDPMScheduler, "from_pretrained", return_value=scheduler), \
                     patch.object(trainer_module, "tb_logger", MagicMock()):
                 trainer = trainer_module.MarigoldTrainer(cfg, pipe, loader, "cpu", ".", str(root / "ckpt"), ".", ".", 2)
+                setup_cpu_precision(trainer)
                 self.assertEqual(trainer.prediction_type, "v_prediction")
                 self.assertEqual(trainer.training_noise_scheduler.alphas_cumprod[-1], 0)
                 trainer.train()
@@ -186,7 +206,11 @@ class SDXLDepthTest(unittest.TestCase):
                 torch.testing.assert_close(vae_before, pipe.vae.encoder.conv_in.weight)
                 pipe2 = tiny_pipeline(root)
                 trainer2 = trainer_module.MarigoldTrainer(cfg, pipe2, loader, "cpu", ".", str(root / "ckpt"), ".", ".", 2)
+                setup_cpu_precision(trainer2)
                 trainer2.load_checkpoint(root / "ckpt/latest")
+                self.assertEqual(trainer2.scaler.state_dict(), trainer.scaler.state_dict())
+                if fp16:
+                    self.assertGreater(trainer2.scaler.state_dict()["_growth_tracker"], 0)
                 self.assertEqual(trainer2.effective_iter, 1)
                 torch.testing.assert_close(pipe.unet.conv_out.weight, pipe2.unet.conv_out.weight)
                 self.assertEqual(trainer2.lr_scheduler.last_epoch, trainer.lr_scheduler.last_epoch)
@@ -225,6 +249,8 @@ class SDXLDepthTest(unittest.TestCase):
         self.assertEqual(demo.dataloader.effective_batch_size, 42)
         self.assertEqual(demo.dataloader.max_train_batch_size, 1)
         self.assertEqual(demo.max_iter, 23000)
+        self.assertEqual(demo.trainer.mixed_precision, "no")
+        self.assertEqual(probe.trainer.mixed_precision, "no")
         self.assertTrue(demo.validity_guided_completion.enabled)
         self.assertNotIn("mode", demo.validity_guided_completion)
         self.assertEqual(demo.validity_guided_completion.anchor_weight, 0.02)
