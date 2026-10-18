@@ -654,15 +654,19 @@ class MarigoldTrainer:
                 self._backward_batch(batch, local_seed)
 
     def _report_memory(self):
-        torch.cuda.synchronize(self.device)
-        free, total = torch.cuda.mem_get_info(self.device)
+        device = torch.device(self.device)
+        # mem_get_info in PyTorch 2.4 rejects an unindexed torch.device('cuda').
+        # Resolve against the current CUDA device rather than assuming GPU 0.
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        torch.cuda.synchronize(device_index)
+        free, total = torch.cuda.mem_get_info(device_index)
         gib = 1024 ** 3
         record = {
             "effective_iter": self.effective_iter,
-            "gpu": torch.cuda.get_device_name(self.device),
-            "allocated_gib": torch.cuda.memory_allocated(self.device) / gib,
-            "peak_allocated_gib": torch.cuda.max_memory_allocated(self.device) / gib,
-            "peak_reserved_gib": torch.cuda.max_memory_reserved(self.device) / gib,
+            "gpu": torch.cuda.get_device_name(device_index),
+            "allocated_gib": torch.cuda.memory_allocated(device_index) / gib,
+            "peak_allocated_gib": torch.cuda.max_memory_allocated(device_index) / gib,
+            "peak_reserved_gib": torch.cuda.max_memory_reserved(device_index) / gib,
             "device_free_gib": free / gib, "device_total_gib": total / gib,
             "backbone": self.cfg.model.get("backbone", "sd2"),
             "optimizer": self.cfg.optimizer.name,
