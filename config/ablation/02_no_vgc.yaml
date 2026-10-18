@@ -1,0 +1,6 @@
+base_config:
+- config/train_marigold.yaml
+
+# 移除无效深度区域中的全部 VGC 监督，包括基础区域均值、平滑和远场锚点。
+validity_guided_completion:
+  enabled: false

@@ -1,0 +1,5 @@
+base_config:
+- config/train_marigold.yaml
+
+# 所有时间步使用等权预测损失；其余扩散设置保持完整方法不变。
+min_snr_enabled: false

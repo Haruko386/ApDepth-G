@@ -1,0 +1,5 @@
+base_config:
+- config/train_sdxl_demo.yaml
+
+# 移除有效深度区域上的 latent gradient consistency。
+latent_gradient_weight: 0.0

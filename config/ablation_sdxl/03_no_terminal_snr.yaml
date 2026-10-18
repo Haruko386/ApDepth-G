@@ -1,0 +1,10 @@
+base_config:
+- config/train_sdxl_demo.yaml
+
+# 消融终端 SNR 对齐，但继续使用 v-prediction，避免改变预测参数化。
+diffusion_schedule:
+  prediction_type: v_prediction
+  rescale_betas_zero_snr: false
+  timestep_spacing: leading
+  min_snr_floor: 0.0
+  terminal_noise_alignment: false

@@ -47,6 +47,8 @@ from .util.image_util import (
     get_tv_resample_method,
     resize_max_res,
 )
+from DA2.depth_anything_v2.dpt import DepthAnythingV2
+from src.util.da2_config import resolve_da2_config, da2_checkpoint_path
 
 class MarigoldDepthOutput(BaseOutput):
     """
@@ -120,6 +122,8 @@ class MarigoldPipeline(DiffusionPipeline):
         shift_invariant: Optional[bool] = True,
         default_denoising_steps: Optional[int] = None,
         default_processing_resolution: Optional[int] = None,
+        da2_config: Optional[dict] = None,
+        da2_conditioning_enabled: bool = True,
     ):
         super().__init__()
         self.register_modules(
@@ -134,6 +138,7 @@ class MarigoldPipeline(DiffusionPipeline):
             shift_invariant=shift_invariant,
             default_denoising_steps=default_denoising_steps,
             default_processing_resolution=default_processing_resolution,
+            da2_conditioning_enabled=da2_conditioning_enabled,
         )
 
         self.scale_invariant = scale_invariant
@@ -142,22 +147,30 @@ class MarigoldPipeline(DiffusionPipeline):
         self.default_processing_resolution = default_processing_resolution
 
         self.empty_text_embed = None
+        self.da2_conditioning_enabled = da2_conditioning_enabled
 
+        da2_config = resolve_da2_config(da2_config)
+        self.register_to_config(da2_config=da2_config)
         self.da2 = self._load_depth_prior()
 
-    @staticmethod
-    def _load_depth_prior():
-        # Lazy import also keeps help/config inspection available without DA2.
-        from DA2.depth_anything_v2.dpt import DepthAnythingV2
-        da2_config = {
-            'encoder':'vitg',
-            'features': 384,
-            'out_channels': [1536, 1536, 1536, 1536]
-        }
+    def _load_depth_prior(self):
+        da2_config = self.config.da2_config
+        checkpoint_path = da2_checkpoint_path(da2_config)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"DA2 checkpoint not found: {checkpoint_path}. "
+                                    "Configure encoder/checkpoint in config/da2.yaml.")
+        prior = DepthAnythingV2(**{
+            key: da2_config[key] for key in ("encoder", "features", "out_channels")
+        })
+        prior.load_state_dict(torch.load(checkpoint_path, map_location="cpu", weights_only=True))
+        return prior.requires_grad_(False).eval()
 
-        prior = DepthAnythingV2(**da2_config)
-        prior.load_state_dict(torch.load(f'DA2/checkpoints/depth_anything_v2_{da2_config["encoder"]}.pth', map_location='cpu', weights_only=True))
-        return prior.to(device="cuda").requires_grad_(False).eval()
+    def to(self, *args, **kwargs):
+        pipeline = super().to(*args, **kwargs)
+        # DA2 is an external frozen prior, not a serialized Diffusers component.
+        # Keep its original fp32 precision while following the pipeline device.
+        self.da2.to(device=self.device)
+        return pipeline
 
     @torch.no_grad()
     def __call__(
@@ -406,7 +419,8 @@ class MarigoldPipeline(DiffusionPipeline):
         """
         device = self.device
         rgb_in = rgb_in.to(device)
-        da2_depth = self.da2.infer_batch(rgb_in).to(device)
+        # rgb_in is ApDepth [-1, 1]. infer_batch performs DA2's required
+        # [0, 1] + ImageNet normalization and returns near=-1/far=+1 depth.
 
         # Set timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -414,7 +428,13 @@ class MarigoldPipeline(DiffusionPipeline):
 
         # Encode image
         rgb_latent = self.encode_rgb(rgb_in)
-        da2_depth_latent = self.encode_rgb(da2_depth)
+        # DA2 raw output is unbounded relative disparity; infer_batch maps it
+        # to the SD2 VAE's [-1, 1] image domain before this call.
+        if self.da2_conditioning_enabled:
+            da2_depth = self.da2.infer_batch(rgb_in).to(device)
+            da2_depth_latent = self.encode_rgb(da2_depth)
+        else:
+            da2_depth_latent = torch.zeros_like(rgb_latent)
 
         # Initial depth map (noise)
         depth_latent = torch.randn(

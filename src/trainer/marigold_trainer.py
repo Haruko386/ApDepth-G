@@ -21,9 +21,9 @@
 
 
 import logging
+import json
 import os
 import shutil
-import json
 from contextlib import nullcontext
 from datetime import datetime
 from typing import List, Union
@@ -41,6 +41,7 @@ from tqdm import tqdm
 from PIL import Image
 
 from marigold.marigold_pipeline import MarigoldPipeline, MarigoldDepthOutput
+from src.dataset.mixed_sampler import MixedBatchSampler
 from src.util import metric
 from src.util.data_loader import skip_first_batches
 from src.util.logging_util import tb_logger, eval_dic_to_text
@@ -51,8 +52,9 @@ from src.util.metric import MetricTracker
 from src.util.multi_res_noise import multi_res_noise_like
 from src.util.alignment import align_depth_least_square
 from src.util.seeding import generate_seed_sequence
-from src.util.residual_completion import (
-    latent_validity_masks, min_snr_weights, residual_completion_loss,
+from src.util.diffusion_training import (
+    align_inference_scheduler, align_training_scheduler,
+    latent_validity_masks, min_snr_weight, terminal_noise_fade,
 )
 
 
@@ -140,6 +142,18 @@ class MarigoldTrainer:
         # Loss
         self.loss = get_loss(loss_name=self.cfg.loss.name, **self.cfg.loss.kwargs)
         self.latent_grad_loss = LatentGradLoss()
+        self.latent_gradient_weight = float(
+            self.cfg.get("latent_gradient_weight", 0.1)
+        )
+        if self.latent_gradient_weight < 0:
+            raise ValueError("latent_gradient_weight must be non-negative")
+
+        # Keep the 12-channel U-Net shape fixed for the DA2 ablation. Setting
+        # this to false replaces only the DA2 conditioning latent with zeros.
+        self.da2_conditioning_enabled = bool(
+            self.cfg.get("da2_conditioning_enabled", True)
+        )
+        self.model.da2_conditioning_enabled = self.da2_conditioning_enabled
 
         # Validity-Guided Completion (VGC)
         # This is a mask-free sky-collapse regularizer: it does not use sky masks
@@ -150,22 +164,49 @@ class MarigoldTrainer:
         self.vgc_min_invalid_ratio = float(vgc_cfg.get("min_invalid_ratio", 0.08))
         self.vgc_anchor_weight = float(vgc_cfg.get("anchor_weight", 0.02))
         self.vgc_smooth_weight = float(vgc_cfg.get("smooth_weight", 0.005))
+        self.vgc_far_anchor_weight = float(vgc_cfg.get("far_anchor_weight", 0.0))
+        self.vgc_far_depth_threshold = float(
+            vgc_cfg.get("far_depth_threshold", 0.5)
+        )
+        self.vgc_min_far_ratio = float(vgc_cfg.get("min_far_ratio", 0.02))
         self.vgc_eps = float(vgc_cfg.get("eps", 1e-6))
-        self.vgc_mode = vgc_cfg.get("mode", "legacy")
-        if self.vgc_mode not in ("legacy", "residual_snr"):
-            raise ValueError(f"Unknown completion mode: {self.vgc_mode}")
-        self.vgc_gradient_weight = float(vgc_cfg.get("gradient_weight", 0.005))
+        if not -1.0 <= self.vgc_far_depth_threshold <= 1.0:
+            raise ValueError("VGC far_depth_threshold must be in [-1, 1]")
+        if self.vgc_far_anchor_weight < 0:
+            raise ValueError("VGC far_anchor_weight must be non-negative")
+        if not 0.0 <= self.vgc_min_far_ratio <= 1.0:
+            raise ValueError("VGC min_far_ratio must be in [0, 1]")
+        self.min_snr_enabled = bool(self.cfg.get("min_snr_enabled", True))
         self.min_snr_gamma = float(self.cfg.get("min_snr_gamma", 5.0))
-        if self.min_snr_gamma <= 0:
+        if self.min_snr_enabled and self.min_snr_gamma <= 0:
             raise ValueError("min_snr_gamma must be positive")
+        self.offset_noise_strength = float(
+            self.cfg.get("offset_noise_strength", 0.1)
+        )
+        if self.offset_noise_strength < 0:
+            raise ValueError("offset_noise_strength must be non-negative")
+        schedule_cfg = self.cfg.get("diffusion_schedule", {})
+        self.min_snr_floor = float(schedule_cfg.get("min_snr_floor", 0.0))
+        self.terminal_noise_alignment = bool(
+            schedule_cfg.get("terminal_noise_alignment", True)
+        )
+        self.terminal_noise_fade_fraction = float(
+            schedule_cfg.get("terminal_noise_fade_fraction", 0.1)
+        )
 
         # Training noise scheduler
-        self.training_noise_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
+        base_training_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
             os.path.join(
                 base_ckpt_dir,
                 cfg.trainer.training_noise_scheduler.pretrained_path,
                 "scheduler",
             )
+        )
+        self.training_noise_scheduler = align_training_scheduler(
+            base_training_scheduler, schedule_cfg
+        )
+        self.model.scheduler = align_inference_scheduler(
+            self.model.scheduler, schedule_cfg
         )
         self.prediction_type = self.training_noise_scheduler.config.prediction_type
         assert (
@@ -179,8 +220,6 @@ class MarigoldTrainer:
         self.metric_funcs = [getattr(metric, _met) for _met in cfg.eval.eval_metrics]
         self.train_metrics = MetricTracker(
             "loss", "diffusion_loss", "latent_gradient_loss", "completion_loss",
-            "completion_anchor", "completion_gradient", "completion_coverage",
-            "completion_snr_weight",
         )
         self.val_metrics = MetricTracker(*[m.__name__ for m in self.metric_funcs])
         # main metric for best checkpoint saving
@@ -258,14 +297,28 @@ class MarigoldTrainer:
 
         self.train_metrics.reset()
         accumulated_step = 0
+        mixed_sampler = self.train_loader.batch_sampler
+        if not isinstance(mixed_sampler, MixedBatchSampler):
+            mixed_sampler = None
+        mixture_counts = (
+            {ds.disp_name: 0 for ds in mixed_sampler.src_dataset_ls}
+            if mixed_sampler is not None else {}
+        )
 
         for epoch in range(self.epoch, self.max_epoch + 1):
             self.epoch = epoch
             logging.debug(f"epoch: {self.epoch}")
 
             # Skip previous batches when resume
+            if mixed_sampler is not None:
+                mixed_sampler.set_epoch_start(
+                    self.effective_iter, accumulated_step, self.n_batch_in_epoch
+                )
             for batch in skip_first_batches(self.train_loader, self.n_batch_in_epoch):
                 self.model.unet.train()
+                if mixed_sampler is not None:
+                    for name in batch["dataset_name"]:
+                        mixture_counts[name] += 1
 
                 # globally consistent random generators
                 if self.seed is not None:
@@ -281,15 +334,27 @@ class MarigoldTrainer:
                 rgb = batch["rgb_norm"].to(device)
                 depth_gt_for_latent = batch[self.gt_depth_type].to(device)
                 with torch.no_grad():
+                    # rgb is ApDepth [-1, 1]. infer_batch converts it to DA2's
+                    # [0, 1] + ImageNet-normalized DINOv2 input, then returns
+                    # near=-1/far=+1 depth in the SD2 VAE input range.
                     da2_depth = self.model.da2.infer_batch(rgb).to(device)
+                    da2_far_pixels = (
+                        da2_depth[:, :1] >= self.vgc_far_depth_threshold
+                    )
 
                 if self.gt_mask_type is not None:
                     valid_mask_for_latent = batch[self.gt_mask_type].to(device)
-                    valid_mask_down, invalid_interior_down = latent_validity_masks(
+                    valid_mask_down, invalid_mask_down = latent_validity_masks(
                         valid_mask_for_latent
                     )
+                    # A DA2-far latent cell is selected only if its entire 8x8
+                    # source block is far. Mixed sky/object boundary cells are
+                    # excluded instead of being smoothed across the boundary.
+                    da2_far_mask_down, _ = latent_validity_masks(da2_far_pixels)
                     valid_mask_down = valid_mask_down.repeat((1, 4, 1, 1))
-                    invalid_mask_down = ~valid_mask_down
+                    invalid_mask_down = invalid_mask_down.repeat((1, 4, 1, 1))
+                    da2_far_mask_down = da2_far_mask_down.repeat((1, 4, 1, 1))
+                    da2_far_mask_down = da2_far_mask_down & invalid_mask_down
                 else:
                     raise NotImplementedError
 
@@ -302,7 +367,8 @@ class MarigoldTrainer:
                     gt_depth_latent = self.encode_depth(
                         depth_gt_for_latent
                     )  # [B, 4, h, w]
-                    # Encode DA2 depth
+                    # infer_batch has already mapped raw DA2 disparity to
+                    # [-1, 1]; encode_rgb must never receive raw DA2 output.
                     da2_depth_latent = self.model.encode_rgb(da2_depth)  # [B, 4, h, w]
                 
                 # Sample a random timestep for each image
@@ -313,11 +379,22 @@ class MarigoldTrainer:
                     device=device,
                     generator=rand_num_generator,
                 ).long()  # [B]
+                if self.terminal_noise_alignment:
+                    terminal_fade = terminal_noise_fade(
+                        timesteps,
+                        self.scheduler_timesteps,
+                        self.terminal_noise_fade_fraction,
+                    )
+                else:
+                    terminal_fade = torch.ones_like(timesteps, dtype=torch.float32)
 
                 if self.apply_multi_res_noise:
                     strength = self.mr_noise_strength
                     if self.annealed_mr_noise:
-                        strength = strength * (timesteps / self.scheduler_timesteps)
+                        strength = strength * (
+                            timesteps / max(self.scheduler_timesteps - 1, 1)
+                        )
+                    strength = strength * terminal_fade
                     noise = multi_res_noise_like(
                         gt_depth_latent,
                         strength=strength,
@@ -331,14 +408,29 @@ class MarigoldTrainer:
                         device=device,
                         generator=rand_num_generator,
                     )  # [B, 4, h, w]
+
+                # Multi-resolution noise is not a standard Gaussian at the last
+                # timestep. Match inference exactly at the pure-noise endpoint.
+                terminal = (timesteps == self.scheduler_timesteps - 1).view(-1, 1, 1, 1)
+                if (
+                    self.terminal_noise_alignment
+                    and self.apply_multi_res_noise
+                    and terminal.any()
+                ):
+                    standard_noise = torch.randn(
+                        gt_depth_latent.shape,
+                        device=device,
+                        generator=rand_num_generator,
+                    )
+                    noise = torch.where(terminal, standard_noise, noise)
                 
-                offset_noise_strength = 0.1
-                offset_noise = torch.randn(
-                    batch_size, gt_depth_latent.shape[1], 1, 1, 
-                    device=device, 
-                    generator=rand_num_generator
-                ) * offset_noise_strength
-                noise = noise + offset_noise
+                if self.offset_noise_strength > 0:
+                    offset_noise = torch.randn(
+                        batch_size, gt_depth_latent.shape[1], 1, 1,
+                        device=device,
+                        generator=rand_num_generator,
+                    ) * self.offset_noise_strength * terminal_fade.view(-1, 1, 1, 1)
+                    noise = noise + offset_noise
 
                 # Add noise to the latents (diffusion forward process)
                 noisy_latents = self.training_noise_scheduler.add_noise(
@@ -351,8 +443,13 @@ class MarigoldTrainer:
                 )  # [B, 77, 1024]
 
                 # Concat rgb and depth latents
+                da2_condition_latent = (
+                    da2_depth_latent
+                    if self.da2_conditioning_enabled
+                    else torch.zeros_like(da2_depth_latent)
+                )
                 cat_latents = torch.cat(
-                    [rgb_latent, da2_depth_latent, noisy_latents], dim=1
+                    [rgb_latent, da2_condition_latent, noisy_latents], dim=1
                 )  # [B, 12, h, w]
                 cat_latents = cat_latents.float()
 
@@ -392,9 +489,15 @@ class MarigoldTrainer:
                     pred_x0 = model_pred # sample type
 
             
-                snr_weight, completion_snr_weight = min_snr_weights(
-                    alpha_prod_t, self.prediction_type, self.min_snr_gamma
-                )
+                if self.min_snr_enabled:
+                    snr_weight = min_snr_weight(
+                        alpha_prod_t,
+                        self.prediction_type,
+                        self.min_snr_gamma,
+                        self.min_snr_floor,
+                    )
+                else:
+                    snr_weight = torch.ones_like(alpha_prod_t)
 
                 diff = model_pred.float() - target.float()
                 if "l1" in self.cfg.loss.name.lower():
@@ -415,20 +518,13 @@ class MarigoldTrainer:
                     latent_loss = unreduced_loss
                     grad_loss = self.latent_grad_loss(pred_x0.float(), gt_depth_latent.float())
 
-                loss = latent_loss.mean() + 0.1 * grad_loss.mean()
+                loss = (
+                    latent_loss.mean()
+                    + self.latent_gradient_weight * grad_loss.mean()
+                )
                 vgc_loss = loss.new_zeros(())
-                completion_stats = {}
 
-                if self.vgc_enabled and self.vgc_mode == "residual_snr":
-                    vgc_loss, completion_stats = residual_completion_loss(
-                        pred_x0, da2_depth_latent, invalid_interior_down,
-                        completion_snr_weight,
-                        anchor_weight=self.vgc_anchor_weight,
-                        gradient_weight=self.vgc_gradient_weight,
-                        min_invalid_ratio=self.vgc_min_invalid_ratio,
-                    )
-                    loss = loss + vgc_loss
-                elif self.vgc_enabled:
+                if self.vgc_enabled:
                     # VGC only supervises invalid-depth regions. This prevents the
                     # regularizer from directly supervising valid pixels. Shared
                     # U-Net parameters still require indoor regression evaluation.
@@ -436,6 +532,7 @@ class MarigoldTrainer:
                         pred_x0=pred_x0.float(),
                         prior_latent=da2_depth_latent.float().detach(),
                         invalid_mask=invalid_mask_down,
+                        far_mask=da2_far_mask_down,
                     )
                     loss = loss + vgc_loss
 
@@ -445,8 +542,6 @@ class MarigoldTrainer:
                 self.train_metrics.update("diffusion_loss", latent_loss.mean().item())
                 self.train_metrics.update("latent_gradient_loss", grad_loss.mean().item())
                 self.train_metrics.update("completion_loss", vgc_loss.item())
-                for name, value in completion_stats.items():
-                    self.train_metrics.update(name, value.item())
 
                 loss = loss / self.gradient_accumulation_steps
                 loss.backward()
@@ -465,6 +560,19 @@ class MarigoldTrainer:
                     self.effective_iter += 1
                     if self.report_cuda_memory and torch.device(device).type == "cuda":
                         self._report_memory()
+
+                    if mixed_sampler is not None:
+                        probabilities = mixed_sampler.probabilities_at(self.effective_iter - 1)
+                        sample_count = sum(mixture_counts.values())
+                        mixture_metrics = {}
+                        for ds, probability in zip(mixed_sampler.src_dataset_ls, probabilities):
+                            name = ds.disp_name
+                            mixture_metrics[f"train_sampling/probability/{name}"] = probability.item()
+                            mixture_metrics[f"train_sampling/observed_ratio/{name}"] = (
+                                mixture_counts[name] / sample_count
+                            )
+                            mixture_counts[name] = 0
+                        tb_logger.log_dic(mixture_metrics, global_step=self.effective_iter)
 
                     # Log to tensorboard
                     accumulated_loss = self.train_metrics.result()["loss"]
@@ -538,7 +646,9 @@ class MarigoldTrainer:
         with open(path, "w", encoding="utf-8") as stream:
             json.dump(record, stream, indent=2)
 
-    def _validity_guided_completion_loss(self, pred_x0, prior_latent, invalid_mask):
+    def _validity_guided_completion_loss(
+        self, pred_x0, prior_latent, invalid_mask, far_mask=None
+    ):
         """Weakly complete invalid-depth regions using the detached DA2 prior.
 
         Outdoor sky and out-of-range regions are often excluded by the valid-depth
@@ -563,8 +673,6 @@ class MarigoldTrainer:
 
         sample_gate = sample_gate.view(-1, 1, 1, 1)
         mask = invalid_mask * sample_gate
-        denom = mask.sum().clamp_min(self.vgc_eps)
-
         # Region-level anchor: align only the mean latent response in invalid
         # regions to the prior. This prevents copying high-frequency DA2 artifacts
         # into sky while still preventing free collapse.
@@ -588,7 +696,41 @@ class MarigoldTrainer:
         smooth_y = (grad_y * mask_y).sum() / mask_y.sum().clamp_min(self.vgc_eps)
         smooth_loss = 0.5 * (smooth_x + smooth_y)
 
-        return self.vgc_anchor_weight * anchor_loss + self.vgc_smooth_weight * smooth_loss
+        # Corrected DA2 uses near=-1/far=+1 in pixel space. Add another weak
+        # region-mean anchor for the subset that is both fully GT-invalid and
+        # confidently far according to DA2. We intentionally do not compare
+        # individual latent pixels because that would copy DA2 sky texture.
+        far_anchor_loss = pred_x0.new_zeros(())
+        if far_mask is not None and self.vgc_far_anchor_weight > 0:
+            far_mask = far_mask.to(device=pred_x0.device, dtype=pred_x0.dtype)
+            if far_mask.shape != pred_x0.shape:
+                far_mask = far_mask.expand_as(pred_x0)
+            far_mask = far_mask * mask
+            far_ratio = far_mask.flatten(1).mean(dim=1)
+            far_gate = (
+                (far_ratio >= self.vgc_min_far_ratio).to(pred_x0.dtype)
+                * sample_gate.flatten()
+            )
+            if far_gate.sum() > 0:
+                far_gate_4d = far_gate.view(-1, 1, 1, 1)
+                far_pred_mean = (pred_x0 * far_mask).sum(
+                    dim=(2, 3), keepdim=True
+                ) / far_mask.sum(dim=(2, 3), keepdim=True).clamp_min(self.vgc_eps)
+                far_prior_mean = (prior_latent * far_mask).sum(
+                    dim=(2, 3), keepdim=True
+                ) / far_mask.sum(dim=(2, 3), keepdim=True).clamp_min(self.vgc_eps)
+                far_anchor_loss = (
+                    (far_pred_mean - far_prior_mean).square()
+                    * far_gate_4d
+                ).sum() / (
+                    far_gate.sum().clamp_min(self.vgc_eps) * pred_x0.shape[1]
+                )
+
+        return (
+            self.vgc_anchor_weight * anchor_loss
+            + self.vgc_smooth_weight * smooth_loss
+            + self.vgc_far_anchor_weight * far_anchor_loss
+        )
 
     def encode_depth(self, depth_in):
         # stack depth into 3-channel
@@ -815,6 +957,24 @@ class MarigoldTrainer:
         unet_path = os.path.join(ckpt_dir, "unet")
         self.model.unet.save_pretrained(unet_path, safe_serialization=False)
         logging.info(f"UNet is saved to: {unet_path}")
+
+        # Inference must use the same prediction type, terminal SNR and timestep
+        # spacing as training. Store the DDIM scheduler beside every U-Net.
+        scheduler_path = os.path.join(ckpt_dir, "scheduler")
+        self.model.scheduler.save_pretrained(scheduler_path)
+        logging.info(f"Inference scheduler is saved to: {scheduler_path}")
+
+        # Store inference-relevant ablation switches beside every checkpoint,
+        # including final checkpoints that do not contain trainer.ckpt.
+        settings = {
+            "backbone": self.cfg.model.get("backbone", "sd2"),
+            "da2_conditioning_enabled": self.da2_conditioning_enabled,
+            "da2_config": OmegaConf.to_container(self.cfg.da2, resolve=True)
+            if self.cfg.get("da2") is not None else None,
+            "diffusion_schedule": OmegaConf.to_container(self.cfg.diffusion_schedule, resolve=True),
+        }
+        with open(os.path.join(ckpt_dir, "inference_settings.json"), "w", encoding="utf-8") as handle:
+            json.dump(settings, handle, indent=2)
 
         if save_train_state:
             state = {

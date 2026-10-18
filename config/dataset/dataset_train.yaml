@@ -2,6 +2,12 @@ dataset:
   train:
     name: mixed
     prob_ls: [0.9, 0.1]
+    # Same order as dataset_list: Hypersim, Virtual KITTI.
+    probability_schedule:
+      enabled: true
+      start_fraction: 0.2
+      end_fraction: 0.8
+      final_prob_ls: [0.8, 0.2]
     dataset_list:
     - name: hypersim
       disp_name: hypersim_train

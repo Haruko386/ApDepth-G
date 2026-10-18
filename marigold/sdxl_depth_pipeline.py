@@ -21,13 +21,17 @@ class SDXLDepthPipeline(MarigoldPipeline):
         shift_invariant: bool = True,
         default_denoising_steps: int = 50,
         default_processing_resolution: int = 768,
+        da2_config: dict = None,
+        da2_conditioning_enabled: bool = True,
     ):
         # The upstream SDXL checkpoint uses Euler; our diffusion objective uses
         # its alpha schedule with multi-step DDIM, with no latent x0 clipping.
         scheduler = DDIMScheduler.from_config(scheduler.config, clip_sample=False)
         super().__init__(unet, vae, scheduler, text_encoder, tokenizer,
                          scale_invariant, shift_invariant,
-                         default_denoising_steps, default_processing_resolution)
+                         default_denoising_steps, default_processing_resolution,
+                         da2_config=da2_config,
+                         da2_conditioning_enabled=da2_conditioning_enabled)
         self.register_modules(text_encoder_2=text_encoder_2, tokenizer_2=tokenizer_2)
         self.rgb_latent_scale_factor = float(vae.config.scaling_factor)
         self.depth_latent_scale_factor = self.rgb_latent_scale_factor
@@ -43,6 +47,12 @@ class SDXLDepthPipeline(MarigoldPipeline):
         # Only the empty prompt is used. Cache it once, then release both CLIPs
         # before pipeline.to(cuda); text weights consume no training VRAM.
         self.register_modules(text_encoder=None, text_encoder_2=None)
+
+    def to(self, *args, **kwargs):
+        pipeline = super().to(*args, **kwargs)
+        # Also preserve FP32 after callers move/cast the whole pipeline.
+        self.vae.to(dtype=torch.float32)
+        return pipeline
 
     @torch.no_grad()
     def encode_empty_text(self):

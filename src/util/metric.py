@@ -14,8 +14,8 @@ class MetricTracker:
         self.reset()
 
     def reset(self):
-        for col in self._data.columns:
-            self._data[col].values[:] = 0
+        # Assign through pandas; NumPy views may be read-only under copy-on-write.
+        self._data.loc[:, :] = 0
 
     def update(self, key, value, n=1):
         if self.writer is not None:

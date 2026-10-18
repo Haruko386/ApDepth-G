@@ -1,328 +1,268 @@
-# ApDepth: Aiming for Precise Monocular Depth Estimation Based on Diffusion Models
+# ApDepth-G: SDXL depth estimation (`nightly`)
 
-This repository is based on [Marigold](https://marigoldmonodepth.github.io), CVPR 2024 Best Paper: [**Repurposing Diffusion-Based Image Generators for Monocular Depth Estimation**](https://arxiv.org/abs/2312.02145)
+ApDepth-G adapts diffusion models for monocular depth estimation, with
+validity-guided completion (VGC) for regions lacking depth supervision.
+Based on [Marigold](https://marigoldmonodepth.github.io/).
 
-[![Website](doc/badges/badge-website.svg)](https://haruko386.github.io/research)
-[![License](https://img.shields.io/badge/License-Apache--2.0-929292)](https://www.apache.org/licenses/LICENSE-2.0)
-[![Hugging Face Model](https://img.shields.io/badge/🤗%20Hugging%20Face-Model-green)](https://huggingface.co/developy/ApDepth)
+[Jiawei Wang](https://haruko386.github.io/),
+[Shuai Yuan](https://syjz.teacher.360eol.com/teacherBasic/preview?teacherId=23776),
+[Mingbo Lei](https://github.com/Ltohka).
 
-[**Jiawei Wang**](https://haruko386.github.io/),
-[Shuai Yuan](https://syjz.teacher.360eol.com/teacherBasic/preview?teacherId=23776)
-[Mingbo Lei](https://github.com/Ltohka)
+This branch fine-tunes **SDXL Base**. `main` uses SD2. The current `main`
+training features are shared through `config/train_marigold.yaml`; SDXL adds
+its dual-text/size conditioning, VAE scaling and memory settings.
+Run every command below from the repository root.
 
-![cover](doc/cover.png)
+## What is synchronized from main
 
-> [!NOTE]
->
-> This project follows the same training methodology as [**ApDepth**](https://github.com/cvrs-ys801/ApDepth) and serves as an extension of its content. It is provided for reference only.
+| Component | SDXL behavior |
+|---|---|
+| Progressive dataset sampling | Hypersim/VKITTI 90/10 to 80/20, indexed by optimizer updates, with resume support |
+| Standalone DA2 | `config/da2.yaml`: vits/vitb/vitl/vitg and checkpoint path; frozen FP32 |
+| Corrected DA2 depth | ImageNet input normalization; near = -1, far = +1 |
+| VGC | Region mean anchor, interior smoothness, corrected DA2 far-region anchor |
+| Terminal SNR alignment | v-prediction, zero terminal SNR, trailing DDIM, structured-noise fade near the endpoint |
+| Training losses/noise | Min-SNR with endpoint floor, multi-resolution noise, offset noise, latent gradient loss |
+| Inference consistency | Matching scheduler, DA2 configuration and conditioning switch restored from checkpoints |
+| Ablations | All 11 SD2 configurations retained; matching SDXL variants in `config/ablation_sdxl/` |
 
-> [!IMPORTANT]
->
-> The active experiment on the `nightly` branch uses **SDXL Base 1.0** and retains
-> multi-step DDIM depth inference. It trains a 12-channel U-Net conditioned on RGB,
-> a frozen DA2-Giant prior, and noisy depth. SDXL training explicitly uses the original
-> VGC objective (`mode: legacy`); `residual_snr` is not active in this experiment.
-> Decoder calibration is retained as a separate optional post-training workflow and
-> is not run by the SDXL training config.
+Only the U-Net is optimized. SDXL keeps the 12-channel RGB/DA2/noisy-depth input,
+FP32 VAE, cached dual-CLIP empty prompt, actual-canvas size conditioning,
+BF16 autocast, gradient checkpointing, PyTorch SDPA and Adam8bit.
+The removed `residual_snr` and decoder-calibration experiments are not part of
+current main training. See [the migration/validation notes](doc/sdxl_demo.md).
 
-## 🛠️ Setup
+## Environment and model files
 
-The model was trained on:
-
-- Ubuntu 22.04 LTS, Python 3.12.9,  CUDA 11.8, GeForce RTX 6000 Ada Generation
-
-The inference code was tested on:
-
-- Ubuntu 22.04 LTS, Python 3.12.9,  CUDA 11.8, GeForce RTX 4090
-
-### 🪧 A Note for Windows users
-
-We recommend running the code in WSL2:
-
-1. Install WSL following [installation guide](https://learn.microsoft.com/en-us/windows/wsl/install#install-wsl-command).
-1. Install CUDA support for WSL following [installation guide](https://docs.nvidia.com/cuda/wsl-user-guide/index.html#cuda-support-for-wsl-2).
-1. Find your drives in `/mnt/<drive letter>/`; check [WSL FAQ](https://learn.microsoft.com/en-us/windows/wsl/faq#how-do-i-access-my-c--drive-) for more details. Navigate to the working directory of choice. 
-
-### 📦 Repository
-
-Clone the repository (requires git):
+Update the server checkout to this branch before starting a new job:
 
 ```bash
-git clone https://github.com/Haruko386/ApDepth-G.git
-cd ApDepth-G
-git switch --track origin/nightly
+git fetch origin nightly
+git switch nightly
+git pull --ff-only origin nightly
 ```
 
-### 💻 Dependencies
-
-**Using Conda:** create an environment and install the base dependencies:
-
-```bash
-conda create -n apdepth python==3.12.9
-conda activate apdepth
-pip install -r requirements.txt
-```
-
-For the SDXL experiment, install its additional dependencies without replacing the
-CUDA-enabled PyTorch installation:
+Use a Linux CUDA environment with a working PyTorch/torchvision pair. If your
+existing SD2 environment already works, clone it before updating dependencies:
 
 ```bash
+conda create -n apdepth-sdxl --clone marigold
+conda activate apdepth-sdxl
 python -m pip install -r requirements-sdxl.txt
+python -m pip check
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_bf16_supported())"
 python -m bitsandbytes
 ```
 
-Keep the environment activated before running the inference script. 
-Activate the environment again after restarting the terminal session.
-
-## 🏃 Testing on your images
-
-### 📷 Prepare images
-
-+ Use selected images under `input`. Or place your images in it, for example, under `input/test-image`, and run the following inference command.
-
-### 🎮 Run inference with paper setting
-
-This setting corresponds to our paper. For academic comparison, please run with this setting.
+Replace `marigold` with your existing environment name. For a fresh environment,
+install a matching CUDA PyTorch/torchvision pair first, then `requirements-sdxl.txt`.
+The SDXL requirements include the runtime packages and do not pin or replace your
+CUDA PyTorch build deliberately. No xformers installation is required for SDXL.
+The memory configuration requires a BF16-capable GPU; measure its peak with the
+probe below before full training.
 
 ```bash
-python run.py \
-    --checkpoint prs-eth/marigold-v1-0 \
-    --ensemble_size 1 \
-    --input_rgb_dir input/in-the-wild_example \
-    --output_dir output/in-the-wild_example
+export BASE_DATA_DIR=/root/Dataset
+export BASE_CKPT_DIR=/root/Marigold/pretrained_checkpoint
+export SDXL_BASE="${BASE_CKPT_DIR}/stable-diffusion-xl-base-1.0"
 ```
 
-You can find all results in `output/in-the-wild_example`. Enjoy!
-
-### ⚙️ Inference settings
-
-The default settings are optimized for the best result. However, the behavior of the code can be customized:
-
-- Trade-offs between the **accuracy** and **speed** (for both options, larger values result in better accuracy at the cost of slower inference.)
-  - `--ensemble_size`: Number of inference passes in the ensemble. For LCM `ensemble_size` is more important than `denoise_steps`. Default: 10
-
-- By default, the inference script resizes input images to the *processing resolution*, and then resizes the prediction back to the original resolution. This gives the best quality, as Stable Diffusion, from which Marigold is derived, performs best at 768x768 resolution.  
-  
-  - `--processing_res`: the processing resolution; set as 0 to process the input resolution directly. When unassigned (`None`), will read default setting from model config. Default: ~~768~~ `None`.
-  - `--output_processing_res`: produce output at the processing resolution instead of upsampling it to the input resolution. Default: False.
-  - `--resample_method`: the resampling method used to resize images and depth predictions. This can be one of `bilinear`, `bicubic`, or `nearest`. Default: `bilinear`.
-
-- `--half_precision` or `--fp16`: Run with half-precision (16-bit float) to have faster speed and reduced VRAM usage, but might lead to suboptimal results.
-- `--seed`: Random seed can be set to ensure additional reproducibility. Default: None (unseeded). Note: forcing `--batch_size 1` helps to increase reproducibility. To ensure full reproducibility, [deterministic mode](https://pytorch.org/docs/stable/notes/randomness.html#avoiding-nondeterministic-algorithms) needs to be used.
-- `--batch_size`: Batch size of repeated inference. Default: 0 (best value determined automatically).
-- `--color_map`: [Colormap](https://matplotlib.org/stable/users/explain/colors/colormaps.html) used to colorize the depth prediction. Default: Spectral. Set to `None` to skip colored depth map generation.
-- `--apple_silicon`: Use Apple Silicon MPS acceleration.
-
-### ⬇ Checkpoint cache
-
-By default, the [checkpoint](https://huggingface.co/prs-eth/marigold-v1-0) is stored in the Hugging Face cache.
-The `HF_HOME` environment variable defines its location and can be overridden, e.g.:
-
-```bash
-export HF_HOME=$(pwd)/cache
-```
-
-Alternatively, use the following script to download the checkpoint weights locally:
-
-```bash
-bash script/download_weights.sh apdepth-G
-```
-
-At inference, specify the checkpoint path:
-
-```bash
-python run.py \
-    --checkpoint checkpoint/marigold-v1-0 \
-    --ensemble_size 10 \
-    --input_rgb_dir input/in-the-wild_example\
-    --output_dir output/in-the-wild_example
-```
-
-## 🦿 Evaluation on test datasets <a name="evaluation"></a>
-
-Install additional dependencies:
-
-```bash
-pip install -r requirements+.txt -r requirements.txt
-```
-
-Set data directory variable (also needed in evaluation scripts) and download [evaluation datasets](https://share.phys.ethz.ch/~pf/bingkedata/marigold/evaluation_dataset) into corresponding subfolders:
-
-```bash
-export BASE_DATA_DIR=<YOUR_DATA_DIR>  # Set target data directory
-
-wget -r -np -nH --cut-dirs=4 -R "index.html*" -P ${BASE_DATA_DIR} https://share.phys.ethz.ch/~pf/bingkedata/marigold/evaluation_dataset/
-```
-
-Run inference and evaluation scripts, for example:
-
-```bash
-# Run inference
-bash script/eval/11_infer_nyu.sh
-
-# Evaluate predictions
-bash script/eval/12_eval_nyu.sh
-```
-
-Note: although the seed has been set, the results might still be slightly different on different hardware.
-
-## 🏋️ Training
-
-Based on the previously created environment, install extended requirements:
-
-```bash
-pip install -r requirements++.txt -r requirements+.txt -r requirements.txt
-```
-
-Set environment parameters for the data directory:
-
-```bash
-export BASE_DATA_DIR=YOUR_DATA_DIR  # directory of training data
-export BASE_CKPT_DIR=YOUR_CHECKPOINT_DIR  # directory of pretrained checkpoint
-```
-
-Download [SDXL Base 1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0)
-into `${BASE_CKPT_DIR}/stable-diffusion-xl-base-1.0`. The refiner and duplicate
-single-file checkpoints are not used:
+Download the base model (no refiner):
 
 ```bash
 python - <<'PY'
 import os
 from huggingface_hub import snapshot_download
-
-base_dir = os.environ["BASE_CKPT_DIR"]
 snapshot_download(
     "stabilityai/stable-diffusion-xl-base-1.0",
-    local_dir=os.path.join(base_dir, "stable-diffusion-xl-base-1.0"),
+    local_dir=os.environ["SDXL_BASE"],
     allow_patterns=[
-        "model_index.json",
-        "*/config.json",
-        "scheduler/*",
-        "tokenizer/*",
-        "tokenizer_2/*",
-        "unet/diffusion_pytorch_model.safetensors",
-        "vae/diffusion_pytorch_model.safetensors",
-        "text_encoder/model.safetensors",
-        "text_encoder_2/model.safetensors",
+        "model_index.json", "*/config.json", "scheduler/*", "tokenizer/*", "tokenizer_2/*",
+        "unet/diffusion_pytorch_model.safetensors", "vae/diffusion_pytorch_model.safetensors",
+        "text_encoder/model.safetensors", "text_encoder_2/model.safetensors",
     ],
 )
 PY
 ```
 
-The project also expects the existing DA2-Giant checkpoint at
-`DA2/checkpoints/depth_anything_v2_vitg.pth`.
+Place the matching DA2 weights at `DA2/checkpoints/depth_anything_v2_vitg.pth`,
+or change `encoder` and `checkpoint` in `config/da2.yaml`. Relative DA2 paths
+are resolved from the repository root. Changing `encoder` selects the matching
+architecture profile; the weight file must match it. DA2 is not included in a
+U-Net checkpoint, so install the same weights on the inference server.
 
-The SDXL main-training stack enabled by `config/train_sdxl_demo.yaml` is:
+Dataset directories and split files remain in `config/dataset/`. The training
+server only needs Hypersim and VKITTI; the inference server needs the five test
+datasets. Paths in the existing YAML files are used directly, including their
+configured crops and resize settings. No data needs to move between servers.
 
-- 12-channel RGB + DA2 prior + noisy-depth conditioning;
-- annealed multi-resolution noise and channel-wise offset noise;
-- prediction-type-correct Min-SNR weighting and valid-region latent-gradient loss;
-- original VGC invalid-region mean anchoring and smoothness (`mode: legacy`).
+## GPU probe and training
 
-`residual_snr` and the other removed failed experiments are not enabled by this SDXL
-configuration. Decoder calibration remains in the repository as an independent
-post-training experiment and is not invoked here.
-
-Prepare for [Hypersim](https://github.com/apple/ml-hypersim) and [Virtual KITTI 2](https://europe.naverlabs.com/research/computer-vision/proxy-virtual-worlds-vkitti-2/) datasets and save into `${BASE_DATA_DIR}`. Please refer to [this README](script/dataset_preprocess/hypersim/README.md) for Hypersim preprocessing.
-
-Before a full run, stop other GPU jobs and run the two-update memory probe. It uses
-one real HyperSim and one real Virtual KITTI sample per optimizer update, allocates
-the 8-bit Adam state, and writes the measured CUDA usage to
-`output/sdxl_probe_v1/train_sdxl_probe/memory_profile.json`:
+First run two updates using one sample from each training dataset per update:
 
 ```bash
 python train.py \
-    --config config/train_sdxl_probe.yaml \
-    --base_data_dir "${BASE_DATA_DIR}" \
-    --base_ckpt_dir "${BASE_CKPT_DIR}" \
-    --output_dir output/sdxl_probe_v1 \
-    --no_wandb
+  --config config/train_sdxl_probe.yaml \
+  --base_data_dir "${BASE_DATA_DIR}" --base_ckpt_dir "${BASE_CKPT_DIR}" \
+  --output_dir output/sdxl_probe_v2 --no_wandb
 ```
 
-Only start the full 23,000-update run after the probe finishes at
-`effective_iter: 2` with safe VRAM headroom:
+Check successful exit and `effective_iter: 2` in
+`output/sdxl_probe_v2/train_sdxl_probe/memory_profile.json`.
+The probe measures both training shapes after optimizer states are allocated;
+it uses a fixed alternating mixture and saves no model checkpoints.
+It is not a full-dataset worst-case memory measurement.
+
+Start **fresh from SDXL Base** with the updated objective:
 
 ```bash
 python train.py \
-    --config config/train_sdxl_demo.yaml \
-    --base_data_dir "${BASE_DATA_DIR}" \
-    --base_ckpt_dir "${BASE_CKPT_DIR}" \
-    --output_dir output/sdxl_demo_v1 \
-    --no_wandb
+  --config config/train_sdxl_demo.yaml \
+  --base_data_dir "${BASE_DATA_DIR}" --base_ckpt_dir "${BASE_CKPT_DIR}" \
+  --output_dir output/sdxl_main_v2 --no_wandb
 ```
 
-The SDXL config trains the full U-Net with microbatch 1, gradient accumulation 42,
-BF16 autocast, activation checkpointing, and 8-bit Adam. It keeps FP32 master
-weights and computes the losses in FP32. See [the SDXL demo notes](doc/sdxl_demo.md)
-for the measured-vs-estimated memory distinction and current validation scope.
+The config filename is retained for compatibility. This is full U-Net training:
+23,000 optimizer updates, microbatch 1, accumulation 42, effective batch 42,
+learning rate 1e-5. The scheduler is configuration state, not an optimized model.
+Training validation loaders are disabled; evaluate separately as shown below.
 
-Resume from the matching SDXL run directory:
+Sampling follows `config/dataset/dataset_train.yaml`: 90% Hypersim / 10% VKITTI
+through 4,600 completed updates, linearly changes to 80% / 20% by update 18,400,
+then stays fixed. At 11,500 completed updates, the next update uses 85% / 15%.
+Each microbatch samples one dataset. These are probabilities, not fixed quotas.
+Set `probability_schedule.enabled: false` for fixed sampling.
+TensorBoard logs target `train_sampling/probability/*` and observed
+`train_sampling/observed_ratio/*`. Worker prefetching does not advance the schedule.
+
+Resume **only a run started with this updated configuration**:
 
 ```bash
 python train.py \
-    --resume_run output/sdxl_demo_v1/train_sdxl_demo/checkpoint/latest \
-    --base_data_dir "${BASE_DATA_DIR}" \
-    --base_ckpt_dir "${BASE_CKPT_DIR}" \
-    --no_wandb
+  --resume_run output/sdxl_main_v2/train_sdxl_demo/checkpoint/latest \
+  --base_data_dir "${BASE_DATA_DIR}" --base_ckpt_dir "${BASE_CKPT_DIR}" --no_wandb
 ```
 
-Run 50-step inference with the trained U-Net. The base SDXL checkpoint alone is not
-a depth estimator and must not be used without `--unet_checkpoint`:
+Resume loads that run's saved `config.yaml`, optimizer state and schedule
+position; editing repository YAML does not update an existing run. Do not reuse
+an SD2 checkpoint or an old epsilon-schedule nightly run for this experiment.
+The final inference checkpoint is `checkpoint/iter_023000`; `latest` also stores
+training state (saved every 250 updates), and backups are saved every 2,000.
+A full FP32 SDXL U-Net is about 9.56 GiB; reserve ample checkpoint disk space.
+
+## Inference on your images
+
+Copy the entire iteration directory to the inference server, including `unet/`,
+`scheduler/` and `inference_settings.json`. Keep the run's `config.yaml` as well.
+Both servers need the same SDXL base and DA2 weights.
 
 ```bash
+export TRAINED=output/sdxl_main_v2/train_sdxl_demo/checkpoint/iter_023000
 python run.py \
-    --backbone sdxl \
-    --checkpoint "${BASE_CKPT_DIR}/stable-diffusion-xl-base-1.0" \
-    --unet_checkpoint output/sdxl_demo_v1/train_sdxl_demo/checkpoint/iter_023000 \
-    --input_rgb_dir input/in-the-wild_example \
-    --output_dir output/sdxl_demo_eval \
-    --denoise_steps 50 \
-    --ensemble_size 1 \
-    --batch_size 1 \
-    --processing_res 768 \
-    --seed 2024
+  --backbone sdxl --checkpoint "${SDXL_BASE}" --unet_checkpoint "${TRAINED}" \
+  --input_rgb_dir input/in-the-wild_example --output_dir output/sdxl_images_v2 \
+  --denoise_steps 50 --ensemble_size 1 --batch_size 1 --processing_res 768 --seed 2024
 ```
 
-Only the U-Net is updated by this training command. The repository still contains
-the optional decoder-calibration workflow, but it is not part of the command above.
-If it is used later, its full multi-step latent cache must be regenerated from the
-selected SDXL U-Net; SD2 caches and calibrated decoders are incompatible with SDXL.
+`run.py` processes all supported images in the input directory. The example uses
+FP32 inference and the ordinary safetensors files downloaded above. Only an
+explicit `--fp16` (alias `--half_precision`) selects FP16; the loader casts the
+ordinary weights, so separate fp16 variant files are not required.
+The SDXL VAE and DA2 remain FP32. DA2 and ablation switches restore automatically
+from checkpoint metadata. If the DA2 path differs between servers, pass
+`--da2_config config/da2.yaml` with the same encoder/weights at their new location.
 
-> [!IMPORTANT]
->
-> Although random seeds have been set, the training result might be slightly different on different hardwares. It's recommended to train without interruption.
+## Dataset inference and evaluation
 
+Use the dataset runner for SDXL; the old numbered shell scripts retain their
+legacy SD2 defaults. All five datasets, in the main-table order:
 
+```bash
+python script/eval_datasets.py \
+  --backbone sdxl --checkpoint "${SDXL_BASE}" --unet_checkpoint "${TRAINED}" \
+  --base_data_dir "${BASE_DATA_DIR}" --output_dir output/sdxl_benchmark_v2 \
+  --datasets nyu kitti eth3d scannet diode
+```
 
-## ✏️ Contributing
+Defaults: 50 DDIM steps, ensemble 1, seed 2024, native processing resolution
+(`--processing_res 0`) and least-square scale/shift alignment on valid GT.
+Both evaluation runners also default to FP32; pass `--fp16` explicitly to
+forward FP16 to their inference commands. Metric evaluation is unchanged.
+The runner forwards the matching checkpoint and stops on failed commands.
+Use `--dry_run` to inspect commands without loading data or weights.
+Use `--datasets nyu kitti` for a subset. A fresh output directory avoids mixing
+predictions from different models. If native-resolution images exceed memory,
+choose a lower `--processing_res` and report that setting with your results.
 
-Please refer to [this](CONTRIBUTING.md) instruction.
+To split inference and evaluation into separate jobs:
 
-## 🤔 Troubleshooting
+```bash
+python script/eval_datasets.py \
+  --phase infer --backbone sdxl \
+  --checkpoint "${SDXL_BASE}" --unet_checkpoint "${TRAINED}" \
+  --base_data_dir "${BASE_DATA_DIR}" --output_dir output/sdxl_benchmark_split_v2
 
-| Problem                                                                                                                                      | Solution                                                       |
-|----------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------|
-| (Windows) Invalid DOS bash script on WSL                                                                                                     | Run `dos2unix <script_name>` to convert script format          |
-| (Windows) error on WSL: `Could not load library libcudnn_cnn_infer.so.8. Error: libcuda.so: cannot open shared object file: No such file or directory` | Run `export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH` |
+python script/eval_datasets.py \
+  --phase eval --base_data_dir "${BASE_DATA_DIR}" \
+  --output_dir output/sdxl_benchmark_split_v2
+```
 
+The evaluation phase needs predictions and GT, not model weights.
+Results are `<output>/<dataset>/prediction/*.npy` (with dataset subdirectories),
+`<output>/<dataset>/eval/metrics.json` and `<output>/paper_results.csv`.
+The CSV reports AbsRel x 100 and delta1 in percent; raw metrics stay in JSON.
+Benchmark valid-depth metrics do not measure unlabeled sky accuracy.
 
-<!-- ## 🎓 Citation
-Please cite our paper:
+The equivalent direct NYUv2 commands are:
 
-```bibtex
-@InProceedings{haruko26apdepth,
-      title={ApDepth: Aiming for Precise Monocular Depth Estimation Based on Diffusion Models},
-      author={Haruko386 and Yuan Shuai},
-      booktitle = {Under review},
-      year={2026}
-}
-``` -->
+```bash
+python infer.py \
+  --backbone sdxl --checkpoint "${SDXL_BASE}" --unet_checkpoint "${TRAINED}" \
+  --dataset_config config/dataset/data_nyu_test.yaml --base_data_dir "${BASE_DATA_DIR}" \
+  --output_dir output/sdxl_nyu_direct/prediction \
+  --denoise_steps 50 --ensemble_size 1 --processing_res 0 --seed 2024
 
-## 🎫 License
+python eval.py \
+  --dataset_config config/dataset/data_nyu_test.yaml --base_data_dir "${BASE_DATA_DIR}" \
+  --prediction_dir output/sdxl_nyu_direct/prediction \
+  --output_dir output/sdxl_nyu_direct/eval --alignment least_square
+```
 
-This work is licensed under the Apache License, Version 2.0 (as defined in the [LICENSE](LICENSE.txt)).
+`eval.py` is backbone-independent. Other configs are `data_kitti_eigen_test.yaml`,
+`data_eth3d.yaml`, `data_scannet_val.yaml`, `data_diode_all.yaml` in `config/dataset/`.
 
-By downloading and using the code and model you agree to the terms in the  [LICENSE](LICENSE.txt).
+## SDXL ablations
 
-[![License](https://img.shields.io/badge/License-Apache--2.0-929292)](https://www.apache.org/licenses/LICENSE-2.0)
+Use the matching [SDXL ablation configs](config/ablation_sdxl/README.md):
+
+```bash
+python train.py --config config/ablation_sdxl/00_full.yaml \
+  --base_data_dir "${BASE_DATA_DIR}" --base_ckpt_dir "${BASE_CKPT_DIR}" \
+  --output_dir output/ablation_sdxl --no_wandb
+
+python script/eval_ablations.py --backbone sdxl \
+  --run_root output/ablation_sdxl --output_dir output/ablation_sdxl_eval \
+  --base_checkpoint "${SDXL_BASE}" --base_data_dir "${BASE_DATA_DIR}" \
+  --ids 00_full --main_extra
+```
+
+Train the other config stems separately. Omitting `--ids` evaluates all eleven
+runs on NYUv2/KITTI; `--main_extra` adds ETH3D/ScanNet/DIODE for `00_full` only.
+Every ablation keeps its own saved scheduler and inference switches, including
+`03_no_terminal_snr` and `08_no_da2_prior`.
+
+## Validation and license
+
+Offline CPU tests use real tiny SDXL U-Net, dual CLIP and VAE components, with
+a synthetic DA2 prior. They check configuration parity, training/backpropagation,
+resume, scheduler/DA2 restoration, multi-step inference and dataset commands.
+Full SDXL weights, BF16/Adam8bit CUDA execution and depth quality must still be
+validated on the server; CPU tests cannot establish those results.
+
+```bash
+python -m pip install pytest
+python -m pytest tests -q
+```
+
+Apache 2.0; see [LICENSE.txt](LICENSE.txt). DA2 has its own
+[license](DA2/LICENSE); pretrained weights retain their upstream licenses.

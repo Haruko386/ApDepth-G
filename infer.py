@@ -32,7 +32,7 @@ from tqdm.auto import tqdm
 
 from marigold import MarigoldPipeline
 from src.util.seeding import seed_all
-from src.util.model_overrides import apply_model_overrides
+from src.util.model_overrides import apply_model_overrides, checkpoint_pipeline_kwargs
 from src.dataset import (
     BaseDepthDataset,
     DatasetMode,
@@ -58,8 +58,8 @@ if "__main__" == __name__:
 
     # dataset setting
     parser.add_argument("--backbone", choices=["sd2", "sdxl"], default="sd2")
-    parser.add_argument("--unet_checkpoint", help="Matching backbone checkpoint containing unet/")
-    parser.add_argument("--decoder_checkpoint", help="Calibration directory containing vae/")
+    parser.add_argument("--unet_checkpoint", help="Matching backbone checkpoint containing unet/ and scheduler/")
+    parser.add_argument("--da2_config", help="DA2 YAML config; defaults to config/da2.yaml for legacy models")
     parser.add_argument(
         "--dataset_config",
         type=str,
@@ -92,9 +92,9 @@ if "__main__" == __name__:
     )
     parser.add_argument(
         "--half_precision",
-        "--fp32",
+        "--fp16",
         action="store_true",
-        help="Run with half-precision (16-bit float), might lead to suboptimal result.",
+        help="Use FP16 explicitly; default is FP32. SDXL VAE and DA2 remain FP32.",
     )
 
     # resolution setting
@@ -201,7 +201,7 @@ if "__main__" == __name__:
     # -------------------- Model --------------------
     if half_precision:
         dtype = torch.float16
-        variant = "fp16"
+        variant = None  # Cast ordinary checkpoint weights; no fp16 filenames required.
         logging.warning(
             f"Running with half precision ({dtype}), might lead to suboptimal result."
         )
@@ -211,17 +211,19 @@ if "__main__" == __name__:
 
     from src.util.pipeline_loader import load_depth_pipeline
     pipe = load_depth_pipeline(
-        checkpoint_path, backbone=args.backbone, variant=variant, torch_dtype=dtype
+        checkpoint_path, backbone=args.backbone, variant=variant, torch_dtype=dtype,
+        **checkpoint_pipeline_kwargs(args.unet_checkpoint, args.da2_config),
     )
-    apply_model_overrides(pipe, args.unet_checkpoint, args.decoder_checkpoint)
+    apply_model_overrides(pipe, args.unet_checkpoint)
     # unet = UNet2DConditionModel.from_pretrained(os.path.join(checkpoint_path, f'unet'))
     # pipe.unet = unet
         
 
-    try:
-        pipe.enable_xformers_memory_efficient_attention()
-    except ImportError:
-        logging.debug("run without xformers")
+    if args.backbone == "sd2":
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+        except ImportError:
+            logging.debug("run without xformers")
 
     pipe = pipe.to(device)
     logging.info(

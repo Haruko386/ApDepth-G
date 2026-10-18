@@ -2,11 +2,15 @@
 
 import json
 from pathlib import Path
+import runpy
+import sys
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
 import torch
+import numpy as np
+from PIL import Image
 from torch import nn
 from diffusers import AutoencoderKL, DDIMScheduler, EulerDiscreteScheduler, UNet2DConditionModel
 from transformers import CLIPTextConfig, CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
@@ -14,6 +18,7 @@ from transformers import CLIPTextConfig, CLIPTextModel, CLIPTextModelWithProject
 from marigold.marigold_pipeline import MarigoldPipeline
 from marigold.sdxl_depth_pipeline import SDXLDepthPipeline
 from src.util.config_util import recursive_load_config
+from src.util.da2_config import load_da2_config
 from src.util.model_overrides import apply_model_overrides
 from src.util.pipeline_loader import load_depth_pipeline
 
@@ -125,13 +130,28 @@ class SDXLDepthTest(unittest.TestCase):
                 library = "diffusers" if name in ("unet", "vae", "scheduler") else "transformers"
                 index[name] = [library, type(component).__name__]
             (root / "model_index.json").write_text(json.dumps(index))
+            da2_config = load_da2_config()
+            da2_config["encoder"] = "vits"
             with patch.object(MarigoldPipeline, "_load_depth_prior", return_value=DummyPrior()):
-                pipe = load_depth_pipeline(root, backbone="sdxl", local_files_only=True)
+                pipe = load_depth_pipeline(root, backbone="sdxl", local_files_only=True,
+                                           da2_config=da2_config, da2_conditioning_enabled=False)
             self.assertIsInstance(pipe, SDXLDepthPipeline)
             self.assertIsNone(pipe.text_encoder_2)
+            self.assertEqual(pipe.config.da2_config["encoder"], "vits")
+            self.assertEqual(pipe.config.da2_config["features"], 64)
+            self.assertFalse(pipe.da2_conditioning_enabled)
+            self.assertEqual(pipe.unet.dtype, torch.float32)
             pipe.to("cpu")
             expand_input(pipe)
             self.assertTrue(torch.isfinite(pipe.single_infer(torch.randn(1, 3, 32, 32), 2, generator=None, show_pbar=False)).all())
+            # Explicit FP16 uses the ordinary files, while SDXL's unsafe VAE
+            # remains FP32 even after a pipeline-wide cast.
+            with patch.object(MarigoldPipeline, "_load_depth_prior", return_value=DummyPrior()):
+                half = load_depth_pipeline(root, backbone="sdxl", local_files_only=True,
+                                           torch_dtype=torch.float16, variant=None)
+            half.to("cpu", torch.float16, silence_dtype_warnings=True)
+            self.assertEqual(half.unet.dtype, torch.float16)
+            self.assertEqual(half.vae.dtype, torch.float32)
 
     def test_checkpointing_training_resume_and_inference_override(self):
         from src.trainer import marigold_trainer as trainer_module
@@ -159,6 +179,8 @@ class SDXLDepthTest(unittest.TestCase):
             with patch.object(trainer_module.DDPMScheduler, "from_pretrained", return_value=scheduler), \
                     patch.object(trainer_module, "tb_logger", MagicMock()):
                 trainer = trainer_module.MarigoldTrainer(cfg, pipe, loader, "cpu", ".", str(root / "ckpt"), ".", ".", 2)
+                self.assertEqual(trainer.prediction_type, "v_prediction")
+                self.assertEqual(trainer.training_noise_scheduler.alphas_cumprod[-1], 0)
                 trainer.train()
                 self.assertFalse(torch.equal(before, pipe.unet.conv_out.weight))
                 torch.testing.assert_close(vae_before, pipe.vae.encoder.conv_in.weight)
@@ -178,6 +200,11 @@ class SDXLDepthTest(unittest.TestCase):
             target = tiny_pipeline(root)
             apply_model_overrides(target, root / "ckpt/iter_000002")
             self.assertEqual(target.unet.config.in_channels, 12)
+            self.assertEqual(target.scheduler.config.prediction_type, "v_prediction")
+            self.assertEqual(target.scheduler.config.timestep_spacing, "trailing")
+            torch.testing.assert_close(target.scheduler.alphas_cumprod, trainer.model.scheduler.alphas_cumprod)
+            settings = json.loads((root / "ckpt/iter_000002/inference_settings.json").read_text())
+            self.assertEqual(settings["backbone"], "sdxl")
             self.assertTrue(torch.isfinite(target.single_infer(torch.randn(1, 3, 32, 32), 3, generator=None, show_pbar=False)).all())
 
     def test_backbone_mismatch_rejected_and_configs_isolated(self):
@@ -185,6 +212,8 @@ class SDXLDepthTest(unittest.TestCase):
             pipe = tiny_pipeline(directory)
             expand_input(pipe)
             pipe.unet.save_pretrained(Path(directory) / "unet")
+            (Path(directory) / "inference_settings.json").write_text(
+                json.dumps({"da2_conditioning_enabled": True}), encoding="utf-8")
             pipe.unet.register_to_config(addition_embed_type=None)
             with self.assertRaisesRegex(ValueError, "backbone mismatch"):
                 apply_model_overrides(pipe, directory)
@@ -197,12 +226,92 @@ class SDXLDepthTest(unittest.TestCase):
         self.assertEqual(demo.dataloader.max_train_batch_size, 1)
         self.assertEqual(demo.max_iter, 23000)
         self.assertTrue(demo.validity_guided_completion.enabled)
-        self.assertEqual(demo.validity_guided_completion.mode, "legacy")
+        self.assertNotIn("mode", demo.validity_guided_completion)
         self.assertEqual(demo.validity_guided_completion.anchor_weight, 0.02)
         self.assertEqual(demo.validity_guided_completion.smooth_weight, 0.005)
-        self.assertEqual(probe.validity_guided_completion.mode, "legacy")
+        self.assertEqual(demo.validity_guided_completion.far_anchor_weight, 0.01)
+        for key in ("diffusion_schedule", "validity_guided_completion", "da2", "dataset"):
+            self.assertEqual(demo[key], sd2[key], key)
+        self.assertEqual(probe.validity_guided_completion, demo.validity_guided_completion)
         self.assertEqual(probe.max_iter, 2)
         self.assertTrue(probe.trainer.memory_probe)
+
+    def test_sdxl_ablations_preserve_all_sd2_feature_switches(self):
+        # Compare the resolved configs, allowing only the intended SDXL changes.
+        from omegaconf import OmegaConf
+
+        def leaves(value, prefix=""):
+            result = {}
+            for key, item in value.items():
+                if key == "base_config":
+                    continue
+                name = f"{prefix}.{key}" if prefix else key
+                if isinstance(item, dict):
+                    result.update(leaves(item, name))
+                else:
+                    result[name] = item
+            return result
+
+        base2 = leaves(OmegaConf.to_container(recursive_load_config("config/train_marigold.yaml"), resolve=True))
+        basexl = leaves(OmegaConf.to_container(recursive_load_config("config/train_sdxl_demo.yaml"), resolve=True))
+        overrides = {key: basexl[key] for key in basexl if base2.get(key) != basexl[key]}
+        for path in Path("config/ablation").glob("*.yaml"):
+            sd2 = leaves(OmegaConf.to_container(recursive_load_config(str(path)), resolve=True))
+            sdxl = leaves(OmegaConf.to_container(recursive_load_config(str(Path("config/ablation_sdxl") / path.name)), resolve=True))
+            self.assertEqual(sdxl, {**sd2, **overrides}, path.name)
+
+    def test_image_and_dataset_cli_with_real_tiny_sdxl(self):
+        from src.util.diffusion_training import align_inference_scheduler
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = root / "base"
+            base.mkdir()
+            parts = tiny_components(base)
+            index = {"_class_name": "StableDiffusionXLPipeline"}
+            for name, component in parts.items():
+                component.save_pretrained(base / name)
+                index[name] = ["diffusers" if name in ("unet", "vae", "scheduler") else "transformers",
+                               type(component).__name__]
+            (base / "model_index.json").write_text(json.dumps(index))
+            pipe = tiny_pipeline(root)
+            expand_input(pipe)
+            checkpoint = root / "trained"
+            pipe.unet.save_pretrained(checkpoint / "unet")
+            schedule = {"prediction_type": "v_prediction", "rescale_betas_zero_snr": True,
+                        "timestep_spacing": "trailing"}
+            align_inference_scheduler(pipe.scheduler, schedule).save_pretrained(checkpoint / "scheduler")
+            da2 = load_da2_config()
+            da2["encoder"] = "vits"
+            (checkpoint / "inference_settings.json").write_text(json.dumps({
+                "backbone": "sdxl", "da2_config": da2,
+                "da2_conditioning_enabled": False, "diffusion_schedule": schedule,
+            }))
+            rgb_dir = root / "rgb"
+            rgb_dir.mkdir()
+            Image.fromarray(np.random.default_rng(0).integers(0, 256, (32, 32, 3), dtype=np.uint8)).save(rgb_dir / "rgb_00000.png")
+            common = ["--backbone", "sdxl", "--checkpoint", str(base),
+                      "--unet_checkpoint", str(checkpoint), "--denoise_steps", "2",
+                      "--ensemble_size", "1", "--processing_res", "0", "--seed", "2024"]
+            split = root / "files.txt"
+            split.write_text("rgb_00000.png unused_depth.png unused_depth.png\n")
+            config = root / "dataset.yaml"
+            config.write_text(f"name: nyu_v2\ndisp_name: tiny_nyu\ndir: rgb\nfilenames: {split.as_posix()}\neigen_valid_mask: false\n")
+            cases = [
+                ("run.py", ["--input_rgb_dir", str(rgb_dir), "--batch_size", "1"], root / "images"),
+                ("infer.py", ["--dataset_config", str(config), "--base_data_dir", str(root)], root / "prediction"),
+            ]
+            for script, extra, output in cases:
+                prior = DummyPrior()
+                prior.infer_batch = MagicMock(side_effect=AssertionError("Disabled DA2 must not run"))
+                with patch.object(MarigoldPipeline, "_load_depth_prior", return_value=prior), \
+                        patch.object(torch.cuda, "is_available", return_value=False), \
+                        patch.object(sys, "argv", [script, *common, *extra, "--output_dir", str(output)]):
+                    runpy.run_path(script, run_name="__main__")
+                predictions = list(output.rglob("*.npy"))
+                self.assertEqual(len(predictions), 1)
+                depth = np.load(predictions[0])
+                self.assertEqual(depth.shape, (32, 32))
+                self.assertTrue(np.isfinite(depth).all())
 
 
 if __name__ == "__main__":
