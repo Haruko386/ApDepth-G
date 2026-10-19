@@ -1,0 +1,6 @@
+base_config:
+- config/train_marigold.yaml
+
+# Remove only U-U neighbor smoothness; retain both regional mean anchors.
+validity_guided_completion:
+  smooth_weight: 0.0

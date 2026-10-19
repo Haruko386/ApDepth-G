@@ -280,6 +280,9 @@ if "__main__" == __name__:
             prob=cfg_data.train.prob_ls,
             shuffle=True,
             generator=loader_generator,
+            probability_schedule=cfg_data.train.get("probability_schedule"),
+            total_steps=cfg.max_iter,
+            accumulation_steps=accumulation_steps,
         )
         train_loader = DataLoader(
             concat_dataset,
@@ -335,7 +338,9 @@ if "__main__" == __name__:
     #     'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
     # }
      
-    _pipeline_kwargs = cfg.pipeline.kwargs if cfg.pipeline.kwargs is not None else {}
+    _pipeline_kwargs = dict(cfg.pipeline.kwargs) if cfg.pipeline.kwargs is not None else {}
+    if cfg.get("da2") is not None:
+        _pipeline_kwargs["da2_config"] = OmegaConf.to_container(cfg.da2, resolve=True)
     model = MarigoldPipeline.from_pretrained(
         os.path.join(base_ckpt_dir, cfg.model.pretrained_path), **_pipeline_kwargs
     )

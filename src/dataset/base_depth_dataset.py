@@ -145,7 +145,8 @@ class BaseDepthDataset(Dataset):
                 rasters["depth_filled_linear"]
             ).clone()
 
-        other = {"index": index, "rgb_relative_path": rgb_rel_path}
+        other = {"index": index, "rgb_relative_path": rgb_rel_path,
+                 "dataset_name": self.disp_name}
 
         return rasters, other
 

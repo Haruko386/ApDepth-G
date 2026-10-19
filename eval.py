@@ -21,6 +21,7 @@
 import argparse
 import logging
 import os
+import json
 
 import numpy as np
 import torch
@@ -42,6 +43,7 @@ from src.util.alignment import (
     disparity2depth,
 )
 from src.util.metric import MetricTracker
+from src.util.diode_evaluation import DIODE_SOBEL_THRESHOLD, refine_diode_valid_mask
 
 eval_metrics = [
     "abs_relative_difference",
@@ -118,7 +120,6 @@ if "__main__" == __name__:
     # -------------------- Device --------------------
     cuda_avail = torch.cuda.is_available() and not no_cuda
     device = torch.device("cuda" if cuda_avail else "cpu")
-    device = "cuda"
     logging.info(f"Device: {device}")
 
     # -------------------- Data --------------------
@@ -154,6 +155,14 @@ if "__main__" == __name__:
         depth_raw = depth_raw_ts.numpy()
         valid_mask = valid_mask_ts.numpy()
 
+        if cfg_data.name == "diode":
+            # Refine before BOTH alignment and metric calculation. Use raw GT,
+            # not predictions or normalized/clipped depth, as in PPD.
+            valid_mask = refine_diode_valid_mask(depth_raw, valid_mask)
+            if not valid_mask.any():
+                raise ValueError(f"No valid DIODE pixels remain after PPD filtering: {rgb_name}")
+            valid_mask_ts = torch.from_numpy(valid_mask)
+
         depth_raw_ts = depth_raw_ts.to(device)
         valid_mask_ts = valid_mask_ts.to(device)
 
@@ -164,11 +173,11 @@ if "__main__" == __name__:
         )
         pred_name = os.path.join(os.path.dirname(rgb_name), pred_basename)
         pred_path = os.path.join(prediction_dir, pred_name)
-        depth_pred = np.load(pred_path)
-
         if not os.path.exists(pred_path):
-            logging.warn(f"Can't find prediction: {pred_path}")
-            continue
+            raise FileNotFoundError(f"Missing prediction; refusing an incomplete evaluation: {pred_path}")
+        depth_pred = np.load(pred_path)
+        if depth_pred.shape != depth_raw.shape or not np.isfinite(depth_pred).all():
+            raise ValueError(f"Prediction must be finite and match GT shape: {pred_path}")
 
         # Align with GT using least square
         if "least_square" == alignment:
@@ -257,6 +266,8 @@ if "__main__" == __name__:
 
     eval_text += f"min_depth = {dataset.min_depth}\n"
     eval_text += f"max_depth = {dataset.max_depth}\n"
+    if cfg_data.name == "diode":
+        eval_text += f"DIODE mask: finite GT in [0.6, 350] m; Sobel L1 <= {DIODE_SOBEL_THRESHOLD}\n"
 
     eval_text += tabulate(
         [metric_tracker.result().keys(), metric_tracker.result().values()]
@@ -271,3 +282,13 @@ if "__main__" == __name__:
     with open(_save_to, "w+") as f:
         f.write(eval_text)
         logging.info(f"Evaluation metrics saved to {_save_to}")
+    with open(os.path.join(output_dir, "metrics.json"), "w", encoding="utf-8") as f:
+        result = {"dataset": dataset.disp_name, "samples": len(dataset),
+                  "alignment": alignment, "metrics": metric_tracker.result()}
+        if cfg_data.name == "diode":
+            result["evaluation_mask"] = {
+                "protocol": "ppd_diode", "depth_range_m": [0.6, 350.0],
+                "sobel_input": "raw_metric_gt", "sobel_norm": "l1",
+                "sobel_threshold": DIODE_SOBEL_THRESHOLD,
+            }
+        json.dump(result, f, indent=2)

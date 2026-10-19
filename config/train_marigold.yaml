@@ -8,6 +8,7 @@ base_config:
 # 下面这个可视化可以不要
 # - config/dataset/dataset_vis.yaml
 - config/model_sdv2.yaml
+- config/da2.yaml
 
 model:
   pretrained_path: sd2-1

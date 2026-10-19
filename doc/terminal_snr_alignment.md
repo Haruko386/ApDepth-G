@@ -52,7 +52,7 @@ diffusion_schedule:
 - 23,000 optimizer steps、effective batch 42、完整多步推理。
 
 明确移除：`residual_snr`、额外 sky mask、远端伪标签、扩大 GT mask、语义关系以及新增的
-invalid-region loss。decoder calibration 后训练代码仍保留，但本轮主训练不执行它。
+invalid-region loss。2026-10-16 用户已终止后训练方向，相关代码已删除。
 
 ## 训练
 
@@ -97,5 +97,4 @@ python run.py \
 训练总 loss 因 epsilon → v prediction 已改变，数值不能与旧日志直接比较。
 
 如果本方案仍失败，应先用 `script.trace_depth_denoising` 对比首个 timestep 和前几步的低频漂移，
-不要继续追加天空监督。后训练保留待用；若以后启用 decoder calibration，必须使用这个 checkpoint
-重新生成完整多步 cache，旧 schedule 的 cache 不可复用。
+不要继续追加天空监督。2026-10-16 用户已终止后训练方向，不再保留 decoder calibration 或残差细化入口。

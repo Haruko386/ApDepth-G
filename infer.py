@@ -32,7 +32,7 @@ from tqdm.auto import tqdm
 
 from marigold import MarigoldPipeline
 from src.util.seeding import seed_all
-from src.util.model_overrides import apply_model_overrides
+from src.util.model_overrides import apply_model_overrides, checkpoint_pipeline_kwargs
 from src.dataset import (
     BaseDepthDataset,
     DatasetMode,
@@ -58,7 +58,7 @@ if "__main__" == __name__:
 
     # dataset setting
     parser.add_argument("--unet_checkpoint", help="Original VGC checkpoint containing unet/")
-    parser.add_argument("--decoder_checkpoint", help="Calibration directory containing vae/")
+    parser.add_argument("--da2_config", help="DA2 YAML config; defaults to config/da2.yaml for legacy models")
     parser.add_argument(
         "--dataset_config",
         type=str,
@@ -209,9 +209,10 @@ if "__main__" == __name__:
         variant = None
 
     pipe = MarigoldPipeline.from_pretrained(
-        checkpoint_path, variant=variant, torch_dtype=dtype
+        checkpoint_path, variant=variant, torch_dtype=dtype,
+        **checkpoint_pipeline_kwargs(args.unet_checkpoint, args.da2_config),
     )
-    apply_model_overrides(pipe, args.unet_checkpoint, args.decoder_checkpoint)
+    apply_model_overrides(pipe, args.unet_checkpoint)
     # unet = UNet2DConditionModel.from_pretrained(os.path.join(checkpoint_path, f'unet'))
     # pipe.unet = unet
         

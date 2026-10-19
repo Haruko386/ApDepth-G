@@ -34,7 +34,8 @@ class MixedBatchSampler(BatchSampler):
     """
 
     def __init__(
-        self, src_dataset_ls, batch_size, drop_last, shuffle, prob=None, generator=None
+        self, src_dataset_ls, batch_size, drop_last, shuffle, prob=None, generator=None,
+        probability_schedule=None, total_steps=None, accumulation_steps=1,
     ):
         self.base_sampler = None
         self.batch_size = batch_size
@@ -77,6 +78,8 @@ class MixedBatchSampler(BatchSampler):
         ]  # index in original dataset
         self.n_batches = [len(b) for b in self.raw_batches]
         self.n_total_batch = sum(self.n_batches)
+        if any(n == 0 for n in self.n_batches):
+            raise ValueError("Each source dataset must provide at least one batch")
 
         # sampling probability
         if prob is None:
@@ -85,15 +88,64 @@ class MixedBatchSampler(BatchSampler):
         else:
             self.prob = torch.as_tensor(prob)
 
+        self.initial_prob = self._normalize_probabilities(self.prob)
+        self.accumulation_steps = int(accumulation_steps)
+        if self.accumulation_steps < 1 or self.accumulation_steps != accumulation_steps:
+            raise ValueError("accumulation_steps must be a positive integer")
+        self.epoch_start_batch = 0
+        schedule = probability_schedule or {}
+        self.schedule_enabled = bool(schedule.get("enabled", False))
+        if self.schedule_enabled:
+            if total_steps is None or total_steps <= 0:
+                raise ValueError("Dynamic sampling requires a positive max_iter")
+            self.final_prob = self._normalize_probabilities(schedule["final_prob_ls"])
+            start = float(schedule.get("start_fraction", 0.2))
+            end = float(schedule.get("end_fraction", 0.8))
+            if not 0 <= start < end <= 1:
+                raise ValueError("Require 0 <= start_fraction < end_fraction <= 1")
+            self.start_step = start * total_steps
+            self.end_step = end * total_steps
+
+    def _normalize_probabilities(self, values):
+        values = torch.as_tensor(list(values), dtype=torch.float64)
+        if (values.ndim != 1 or len(values) != self.n_dataset
+                or not torch.isfinite(values).all() or (values < 0).any()
+                or values.sum() <= 0):
+            raise ValueError("Dataset probabilities must be finite, nonnegative, "
+                             "match the dataset count, and have a positive sum")
+        return values / values.sum()
+
+    def probabilities_at(self, completed_steps):
+        """Probabilities for the update following completed_steps optimizer steps."""
+        if not self.schedule_enabled:
+            return self.initial_prob.clone()
+        fraction = min(1.0, max(0.0, (completed_steps - self.start_step)
+                               / (self.end_step - self.start_step)))
+        return self.initial_prob.lerp(self.final_prob, fraction)
+
+    def set_epoch_start(self, completed_steps, accumulated_batches=0, skipped_batches=0):
+        # Assign probabilities by a batch's logical training position, not by
+        # when DataLoader happens to prefetch it. On resume, SkipBatchSampler
+        # replays skipped batches, so their positions must be subtracted here.
+        start = (completed_steps * self.accumulation_steps
+                 + accumulated_batches - skipped_batches)
+        if start < 0:
+            raise ValueError("Epoch start precedes the beginning of training")
+        self.epoch_start_batch = start
+
     def __iter__(self):
         """_summary_
 
         Yields:
             list(int): a batch of indics, corresponding to ConcatDataset of src_dataset_ls
         """
-        for _ in range(self.n_total_batch):
+        epoch_start_batch = self.epoch_start_batch
+        for batch_index in range(self.n_total_batch):
+            completed_steps = (epoch_start_batch + batch_index) // self.accumulation_steps
+            # Preserve the original fixed sampler when scheduling is disabled.
+            prob = self.probabilities_at(completed_steps) if self.schedule_enabled else self.prob
             idx_ds = torch.multinomial(
-                self.prob, 1, replacement=True, generator=self.generator
+                prob, 1, replacement=True, generator=self.generator
             ).item()
             # if batch list is empty, generate new list
             if 0 == len(self.raw_batches[idx_ds]):

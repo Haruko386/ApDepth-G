@@ -1,0 +1,6 @@
+# Version the relative-depth runtime; keep weights and upstream demos local.
+/*
+!/.gitignore
+!/LICENSE
+!/requirements.txt
+!/depth_anything_v2/

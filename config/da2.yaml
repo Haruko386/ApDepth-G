@@ -1,0 +1,18 @@
+# Shared by training and inference. Relative checkpoint paths use the repo root.
+da2:
+  encoder: vitg  # vits, vitb, vitl, vitg
+  # null selects DA2/checkpoints/depth_anything_v2_<encoder>.pth
+  checkpoint: null
+  model_configs:
+    vits:
+      features: 64
+      out_channels: [48, 96, 192, 384]
+    vitb:
+      features: 128
+      out_channels: [96, 192, 384, 768]
+    vitl:
+      features: 256
+      out_channels: [256, 512, 1024, 1024]
+    vitg:
+      features: 384
+      out_channels: [1536, 1536, 1536, 1536]

@@ -21,6 +21,7 @@
 
 
 import logging
+import json
 import os
 import shutil
 from datetime import datetime
@@ -39,6 +40,7 @@ from tqdm import tqdm
 from PIL import Image
 
 from marigold.marigold_pipeline import MarigoldPipeline, MarigoldDepthOutput
+from src.dataset.mixed_sampler import MixedBatchSampler
 from src.util import metric
 from src.util.data_loader import skip_first_batches
 from src.util.logging_util import tb_logger, eval_dic_to_text
@@ -128,6 +130,7 @@ class MarigoldTrainer:
         self.da2_conditioning_enabled = bool(
             self.cfg.get("da2_conditioning_enabled", True)
         )
+        self.model.da2_conditioning_enabled = self.da2_conditioning_enabled
 
         # Validity-Guided Completion (VGC)
         # This is a mask-free sky-collapse regularizer: it does not use sky masks
@@ -269,14 +272,28 @@ class MarigoldTrainer:
 
         self.train_metrics.reset()
         accumulated_step = 0
+        mixed_sampler = self.train_loader.batch_sampler
+        if not isinstance(mixed_sampler, MixedBatchSampler):
+            mixed_sampler = None
+        mixture_counts = (
+            {ds.disp_name: 0 for ds in mixed_sampler.src_dataset_ls}
+            if mixed_sampler is not None else {}
+        )
 
         for epoch in range(self.epoch, self.max_epoch + 1):
             self.epoch = epoch
             logging.debug(f"epoch: {self.epoch}")
 
             # Skip previous batches when resume
+            if mixed_sampler is not None:
+                mixed_sampler.set_epoch_start(
+                    self.effective_iter, accumulated_step, self.n_batch_in_epoch
+                )
             for batch in skip_first_batches(self.train_loader, self.n_batch_in_epoch):
                 self.model.unet.train()
+                if mixed_sampler is not None:
+                    for name in batch["dataset_name"]:
+                        mixture_counts[name] += 1
 
                 # globally consistent random generators
                 if self.seed is not None:
@@ -510,6 +527,19 @@ class MarigoldTrainer:
                     accumulated_step = 0
 
                     self.effective_iter += 1
+
+                    if mixed_sampler is not None:
+                        probabilities = mixed_sampler.probabilities_at(self.effective_iter - 1)
+                        sample_count = sum(mixture_counts.values())
+                        mixture_metrics = {}
+                        for ds, probability in zip(mixed_sampler.src_dataset_ls, probabilities):
+                            name = ds.disp_name
+                            mixture_metrics[f"train_sampling/probability/{name}"] = probability.item()
+                            mixture_metrics[f"train_sampling/observed_ratio/{name}"] = (
+                                mixture_counts[name] / sample_count
+                            )
+                            mixture_counts[name] = 0
+                        tb_logger.log_dic(mixture_metrics, global_step=self.effective_iter)
 
                     # Log to tensorboard
                     accumulated_loss = self.train_metrics.result()["loss"]
@@ -875,6 +905,17 @@ class MarigoldTrainer:
         scheduler_path = os.path.join(ckpt_dir, "scheduler")
         self.model.scheduler.save_pretrained(scheduler_path)
         logging.info(f"Inference scheduler is saved to: {scheduler_path}")
+
+        # Store inference-relevant ablation switches beside every checkpoint,
+        # including final checkpoints that do not contain trainer.ckpt.
+        settings = {
+            "da2_conditioning_enabled": self.da2_conditioning_enabled,
+            "da2_config": OmegaConf.to_container(self.cfg.da2, resolve=True)
+            if self.cfg.get("da2") is not None else None,
+            "diffusion_schedule": OmegaConf.to_container(self.cfg.diffusion_schedule, resolve=True),
+        }
+        with open(os.path.join(ckpt_dir, "inference_settings.json"), "w", encoding="utf-8") as handle:
+            json.dump(settings, handle, indent=2)
 
         if save_train_state:
             state = {
