@@ -1,7 +1,7 @@
 # A 540-row subset of the original Scene01 validation list; source scene split unchanged.
 name: vkitti
-disp_name: vkitti_val_sampled_540
+disp_name: vkitti_val_sampled
 dir: vkitti/vkitti.tar
-filenames: data_split/vkitti/vkitti_val_sampled_540.txt
+filenames: data_split/vkitti/vkitti_val_sampled.txt
 kitti_bm_crop: true
 valid_mask_crop: eigen
