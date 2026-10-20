@@ -167,6 +167,9 @@ class MarigoldTrainer:
         self.terminal_noise_alignment = bool(
             schedule_cfg.get("terminal_noise_alignment", True)
         )
+        self.terminal_noise_fade_enabled = bool(
+            schedule_cfg.get("terminal_noise_fade_enabled", self.terminal_noise_alignment)
+        )
         self.terminal_noise_fade_fraction = float(
             schedule_cfg.get("terminal_noise_fade_fraction", 0.1)
         )
@@ -354,7 +357,7 @@ class MarigoldTrainer:
                     device=device,
                     generator=rand_num_generator,
                 ).long()  # [B]
-                if self.terminal_noise_alignment:
+                if self.terminal_noise_fade_enabled:
                     terminal_fade = terminal_noise_fade(
                         timesteps,
                         self.scheduler_timesteps,
@@ -398,7 +401,8 @@ class MarigoldTrainer:
                         generator=rand_num_generator,
                     )
                     noise = torch.where(terminal, standard_noise, noise)
-                
+
+                terminal_standard_noise = noise
                 if self.offset_noise_strength > 0:
                     offset_noise = torch.randn(
                         batch_size, gt_depth_latent.shape[1], 1, 1,
@@ -406,6 +410,10 @@ class MarigoldTrainer:
                         generator=rand_num_generator,
                     ) * self.offset_noise_strength * terminal_fade.view(-1, 1, 1, 1)
                     noise = noise + offset_noise
+                if self.terminal_noise_alignment:
+                    # N2 disables fading, but T-1 must still be standard
+                    # Gaussian: remove the offset augmentation at this endpoint.
+                    noise = torch.where(terminal, terminal_standard_noise, noise)
 
                 # Add noise to the latents (diffusion forward process)
                 noisy_latents = self.training_noise_scheduler.add_noise(

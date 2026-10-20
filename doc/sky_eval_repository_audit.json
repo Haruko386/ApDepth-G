@@ -1,0 +1,95 @@
+{
+  "date": "2026-10-19",
+  "commit": "02e2571257fbf2bfcc4655e183793255023a3746",
+  "branch": "main",
+  "runtime_tests": "NOT RUN: user requested implementation only",
+  "model_or_dataset_downloads": "none",
+  "protected_directory": "ApDepth-G-paper excluded from reads/writes",
+  "static_checks": [
+    {
+      "path": "src/sky_eval/__init__.py",
+      "ast_syntax": "passed",
+      "test_methods": 0
+    },
+    {
+      "path": "src/sky_eval/aggregate.py",
+      "ast_syntax": "passed",
+      "test_methods": 0
+    },
+    {
+      "path": "src/sky_eval/audit.py",
+      "ast_syntax": "passed",
+      "test_methods": 0
+    },
+    {
+      "path": "src/sky_eval/datasets.py",
+      "ast_syntax": "passed",
+      "test_methods": 0
+    },
+    {
+      "path": "src/sky_eval/masks.py",
+      "ast_syntax": "passed",
+      "test_methods": 0
+    },
+    {
+      "path": "src/sky_eval/metrics.py",
+      "ast_syntax": "passed",
+      "test_methods": 0
+    },
+    {
+      "path": "src/sky_eval/predictions.py",
+      "ast_syntax": "passed",
+      "test_methods": 0
+    },
+    {
+      "path": "src/sky_eval/schemas.py",
+      "ast_syntax": "passed",
+      "test_methods": 0
+    },
+    {
+      "path": "src/sky_eval/visuals.py",
+      "ast_syntax": "passed",
+      "test_methods": 0
+    },
+    {
+      "path": "src/sky_eval/workflow.py",
+      "ast_syntax": "passed",
+      "test_methods": 0
+    },
+    {
+      "path": "script/sky_eval.py",
+      "ast_syntax": "passed",
+      "test_methods": 0
+    },
+    {
+      "path": "tests/sky_eval/test_scoe.py",
+      "ast_syntax": "passed",
+      "test_methods": 17
+    }
+  ],
+  "splits": {
+    "train": {
+      "path": "data_split/vkitti/vkitti_train.txt",
+      "sha256": "73328744b6c7c55278ee0b001d888643aebba3b89fc332213517780aa8eda7ed",
+      "count": 20148,
+      "scenes": {
+        "Scene02": 2796,
+        "Scene06": 3240,
+        "Scene18": 4068,
+        "Scene20": 10044
+      }
+    },
+    "val": {
+      "path": "data_split/vkitti/vkitti_val.txt",
+      "sha256": "2c09f3af5a374e673a8c651f031e246582b605d707199fa768a387ebd9f22c27",
+      "count": 5364,
+      "scenes": {
+        "Scene01": 5364
+      }
+    }
+  },
+  "data_status": "User confirmed required semantic annotations, HRWSI, target predictions and training records unavailable",
+  "exact_overlap_count": 0,
+  "scene_overlap": [],
+  "checkpoint_independence": "pending: repository lists alone do not verify training history"
+}

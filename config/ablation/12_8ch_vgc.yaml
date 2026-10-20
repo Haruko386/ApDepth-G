@@ -1,0 +1,9 @@
+base_config:
+- config/train_marigold.yaml
+
+# Table III: genuine 8ch input. DA2 is used ONLY for training-time VGC targets.
+# VGC keeps the full model's regional anchor, smoothness and far-field anchor.
+unet_in_channels: 8
+da2_conditioning_enabled: false
+validity_guided_completion:
+  enabled: true

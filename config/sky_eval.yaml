@@ -1,0 +1,41 @@
+protocol:
+  name: SCOE
+  version: '1.0'
+  min_sky_fraction: 0.05
+  sky_interior_erosion_fraction: 0.01
+  boundary_band_fraction: 0.02
+  boundary_inner_offset_fraction: 0.01
+  min_boundary_pairs: 50
+  boundary_stride: 2
+  percentile_method: linear
+  aggregation: per_image_macro_mean
+  allow_scene_leakage: false
+  max_failure_fraction: 0.0
+
+datasets:
+  hrwsi:
+    enabled: true
+    root: null
+    manifest: null
+    sky_values: null
+    non_sky_values: null
+    split_provenance: null
+    mask_provenance: null
+    qa_reviewed: false
+    qa_review_count: 0
+  vkitti2:
+    enabled: true
+    rgb_root: null
+    class_seg_root: null
+    train_list: data_split/vkitti/vkitti_train.txt
+    test_list: data_split/vkitti/vkitti_val.txt
+    split: repository_validation_scene01
+    split_provenance: repository lists; target checkpoint training snapshot pending
+    mask_provenance: null
+    qa_reviewed: false
+
+models: {}
+cross_dataset_duplicate_reviewed: false
+output:
+  root: output/sky_eval
+  run_id: scoe_v1

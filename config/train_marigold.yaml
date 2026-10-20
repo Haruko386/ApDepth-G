@@ -11,7 +11,7 @@ base_config:
 - config/da2.yaml
 
 model:
-  pretrained_path: sd2-1
+  pretrained_path: stable-diffusion-2
 
 pipeline:
   name: MarigoldPipeline
@@ -57,7 +57,7 @@ gt_mask_type: valid_mask_raw
 
 # 建议这个数字不要再动
 max_epoch: 10000  # a large enough number to ensure convergence
-max_iter: 23000 # optimizer updates; effective batch 42 (7 x 6)
+max_iter: 8000 # optimizer updates; effective batch 42 (7 x 6)
 
 optimizer:
   name: Adam

@@ -156,6 +156,164 @@ For per-image supervision coverage records and local bar-chart generation, see
 
 Note: although the seed has been set, the results might still be slightly different on different hardware.
 
+### Mask2Former 天空分割：VKITTI2 / KITTI / DIODE
+
+使用 [script/segment_sky.py](script/segment_sky.py) 为评估 RGB 生成天空二值掩码。
+脚本从 `--base_data_dir` 或环境变量 `BASE_DATA_DIR` 读取数据，支持已解压目录和 `.tar`，
+不需要 depth GT、官方天空标签或预先解压归档。配置见
+[config/sky_segmentation.yaml](config/sky_segmentation.yaml)。
+
+通过必填的 `--data_split` 传入已有名单，**分割和后续 eval 使用同一份 split**。
+名单第一列为相对数据集 RGB 根目录的图片路径，其余 GT 路径、焦距等列原样保留；支持空行和 `#` 注释。
+不会改写你的 split，也不会自动换回 dataset config 中的默认名单。
+以下是项目已有划分与默认 RGB 寻址配置，可直接传入相应名单：
+
+| 名称 | 默认配置 / 划分 | 默认数据位置（相对 BASE_DATA_DIR） |
+|---|---|---|
+| `vkitti2`（也接受 `vkitti`） | `data_vkitti_val.yaml`，仓库 Scene01 验证集 | `vkitti/vkitti.tar`，或 `vkitti/vkitti_rgb` / `vkitti` |
+| `kitti` | `data_kitti_eigen_test.yaml`，Eigen test | `kitti/kitti_eigen_split_test.tar`，或 `kitti/kitti_eigen_split_test` / `kitti` |
+| `diode` | `data_diode_all.yaml`，发布的全部验证集，包含 indoors/outdoors | `diode/diode_val.tar`，或 `diode/diode_val` / `diode` |
+
+**VKITTI 小规模评估：** 使用 `data_split/vkitti/vkitti_val_sampled_540.txt`，
+仅从原 5,364 张 `vkitti_val.txt` 抽取 540 张，不引入 train。
+按 6 种 variation × 2 个 camera 均衡取样，每组 45 张，覆盖原序列不同时间位置。
+使用时将该路径传给 `--data_split`，并选择新的 output_dir 运行名；原 train/val 均保留不变。
+详细抽样规则、配置和交集审计见 [VKITTI split 说明](data_split/vkitti/README.md)。
+
+例如 `BASE_DATA_DIR=/data` 时，VKITTI 解压后的第一张 RGB 应位于
+`/data/vkitti/vkitti_rgb/rgb/Scene01/clone/frames/rgb/Camera_0/rgb_00000.jpg`。
+目录结构不同时，在分割配置的 `datasets.<name>.data_dir` 中填写相对 `BASE_DATA_DIR` 的目录或归档路径；
+该路径下必须能直接找到名单第一列所写的相对路径。指定 `data_dir` 后不再自动回退。
+数据读取按原配置路径、列出的解压目录依次尝试；不会扫描训练集扩大样本范围。
+例如 DIODE 只需要 outdoors 时，直接传
+`--dataset diode --data_split data_split/diode/diode_val_outdoor_filename_list.txt`。
+`--dataset` 与 `--datasets` 等价；标准 `data_split/kitti/...` 等路径可以省略 dataset 参数自动识别。
+自定义位置的名单请明确传 dataset。批量处理时，每个 dataset 对应一个 split，按参数顺序配对。
+
+**本地模型准备。** 使用 Transformers 格式的完整 Mask2Former 模型目录，包含 `config.json`、
+`preprocessor_config.json` 和权重文件。三个数据集应固定使用同一个分割 checkpoint。
+可选用 [facebook/mask2former-swin-large-ade-semantic](https://huggingface.co/facebook/mask2former-swin-large-ade-semantic)
+作为统一的 ADE20K 语义分割模型；这是覆盖不同场景的起点，实际天空标签质量仍需人工检查。
+运行环境需要项目已有的 PyTorch / Transformers，以及 NumPy、Pillow、PyYAML、SciPy。
+脚本只接受**已存在的本地模型目录**，强制离线加载，不会自动下载模型或数据集。
+
+先检查 RGB 路径（不加载模型、不写输出）：
+
+```bash
+export BASE_DATA_DIR=/path/to/datasets
+python -B script/segment_sky.py \
+    --base_data_dir "$BASE_DATA_DIR" \
+    --dataset kitti \
+    --data_split data_split/kitti/eigen_test_files_with_gt.txt \
+    --dry-run
+```
+
+生成全部天空掩码：
+
+```bash
+python -B script/segment_sky.py \
+    --config config/sky_segmentation.yaml \
+    --base_data_dir "$BASE_DATA_DIR" \
+    --checkpoint /path/to/local/mask2former-swin-large-ade-semantic \
+    --datasets vkitti2 kitti diode \
+    --data_split data_split/vkitti/vkitti_val.txt \
+                 data_split/kitti/eigen_test_files_with_gt.txt \
+                 data_split/diode/diode_val_all_filename_list.txt \
+    --device cuda \
+    --output_dir output/sky_segmentation/mask2former_v1
+```
+
+Windows PowerShell 使用同一入口，例如只处理本地 VKITTI：
+
+```powershell
+$env:BASE_DATA_DIR = 'F:\'
+python -B script/segment_sky.py --dataset vkitti2 --data_split data_split/vkitti/vkitti_val.txt --dry-run
+python -B script/segment_sky.py --dataset vkitti2 `
+    --data_split data_split/vkitti/vkitti_val.txt `
+    --checkpoint 'D:\models\mask2former-swin-large-ade-semantic' `
+    --device cuda --output_dir output/sky_segmentation/vkitti_mask2former_v1
+```
+
+`--device cpu` 可用于 CPU；默认 `auto` 优先 CUDA。
+`--limit-samples 5` 可以生成每个数据集前 5 张的预览，但结果会明确标记为 limited。
+实际分割始终逐张处理，使用 checkpoint 自带 processor，并通过官方
+[`post_process_semantic_segmentation(..., target_sizes=[(H,W)])`](https://huggingface.co/docs/transformers/en/model_doc/mask2former#transformers.Mask2FormerImageProcessor.post_process_semantic_segmentation)
+在原 RGB 尺寸上得到类别图。从模型 `id2label` 查找 `sky`，不硬编码 ADE20K/Cityscapes 类别编号。
+输出 `255=sky`、`0=non-sky`；不做后续膨胀、填洞、深度有效性筛选或额外裁剪。
+全黑掩码也是有效输出；无天空样本仍保留在生成名单中。
+
+**掩码直接保存到数据集文件夹下**，按 RGB 相对路径组织，运行名取 `--output_dir` 的最后一级目录名。
+目录数据写到 `<RGB根目录>/sky_masks/<运行名>/`；tar 数据写到 `<tar所在目录>/sky_masks/<运行名>/`。
+例如 KITTI 使用 `BASE_DATA_DIR/kitti/kitti_eigen_split_test.tar` 时：
+
+```text
+<BASE_DATA_DIR>/kitti/sky_masks/mask2former_v1/
+  <RGB相对路径>.sky.png
+```
+
+`--output_dir` 只存放运行记录、索引、预览和后续 eval 配置，配置中自动引用数据集内的掩码：
+
+```text
+output/sky_segmentation/mask2former_v1/
+  run_metadata.json               # checkpoint/processor/权重哈希、环境、分割规则
+  summary.json                    # 各数据集成功、失败、无天空、>=5% 天空数量
+  sky_eval.generated.yaml         # 仅在所有选中图像分割成功后导出
+  vkitti2/                        # kitti/、diode/ 同样组织
+    manifest.jsonl                # sample_id、RGB/mask 路径、尺寸、哈希、伪标签来源
+    per_image.jsonl               # 每个输入的状态和失败原因
+    segmentation_report.json
+    previews/                     # 最多 50 张均匀选取的 RGB+天空叠加图
+    depth_inference.yaml          # 复用 infer.py 的完整图像配置
+    depth_inference_files.txt      # 此次选中的原始名单行
+```
+
+运行输出目录和数据集内的掩码运行目录必须是新目录；同一个运行名不覆盖旧掩码。
+换 split 或分割模型时请同时使用新的 `--output_dir` 运行名。
+退出码 `0` 表示完成，`2` 表示错误/不完整；
+发生逐图失败时记录原因，不导出可用于评估的生成配置。修正问题后使用新的输出目录重新运行。
+
+**接入天空深度评估。** 这些掩码来自 **Mask2Former 伪语义标签**，与官方 sky GT 的结果应区分。
+先检查叠加图，再使用生成的 `sky_eval.generated.yaml`。每个深度模型共用同一套冻结的分割结果。
+`eval.py` 的常规 GT 深度指标仍使用原协议；天空一致性和排序使用独立的 `script/sky_eval.py`。
+
+KITTI/VKITTI 原 benchmark 推理会裁剪，旧裁剪预测不能和完整天空图直接配对。
+生成的 `depth_inference.yaml` 关闭 benchmark crop，标准名单的 `filenames` 直接指向你传入的原始 `--data_split`，
+SCOE 配置中的 `data_split` 也指向同一文件。任何 split 修改都会被检查出来，不能悄悄变更评估集合。
+使用 `--limit-samples` 时，推理配置引用对应前 N 张的名单快照，并将结果标记为 limited。
+名单含空行/注释时，为兼容原 `infer.py`，推理配置引用移除这些非数据行的快照，图像集合和顺序保持一致。
+要复用深度推理，split 的其余列仍须满足原 dataset loader 的格式；仅生成天空掩码时只读第一列。
+可用原入口重新生成完整图预测：
+
+```bash
+# BASE_CKPT_DIR 和 CELESTE_CHECKPOINT 必须指向现有本地深度模型及匹配的 scheduler/config。
+for dataset in vkitti2 kitti diode; do
+  python infer.py \
+      --checkpoint "$BASE_CKPT_DIR/sd2-1" \
+      --unet_checkpoint "$CELESTE_CHECKPOINT" \
+      --base_data_dir "$BASE_DATA_DIR" \
+      --dataset_config "output/sky_segmentation/mask2former_v1/$dataset/depth_inference.yaml" \
+      --output_dir "output/sky_predictions/celeste_full/$dataset" \
+      --denoise_steps 50 --ensemble_size 1 --processing_res 768 --seed 2024
+done
+```
+
+在 `sky_eval.generated.yaml` 的 `models` 中填写实际深度模型记录，可参考
+[config/sky_eval_mask2former_models.example.yaml](config/sky_eval_mask2former_models.example.yaml)。
+`layout: infer_split` 自动读取 `<root>/<dataset>/<RGB相对父目录>/pred_<RGB stem>.npy`。
+先填写并核实 checkpoint、输出表示、方向和推理元数据，再执行 audit；之后不修改该配置。
+
+```bash
+python -B script/sky_eval.py audit --config output/sky_segmentation/mask2former_v1/sky_eval.generated.yaml
+# audit 对伪标签诊断协议返回 2 并记录原因；检查无数据失败后，继续下面各步。
+python -B script/sky_eval.py prepare --config output/sky_segmentation/mask2former_v1/sky_eval.generated.yaml
+python -B script/sky_eval.py evaluate --config output/sky_segmentation/mask2former_v1/sky_eval.generated.yaml --model celeste_full
+python -B script/sky_eval.py report --config output/sky_segmentation/mask2former_v1/sky_eval.generated.yaml
+```
+
+诊断报告分别导出 VKITTI2 / KITTI / DIODE 的指标和有效样本数；5% 天空筛选在 audit 阶段完成。
+`--formal` 对这套伪标签协议保持阻断，避免混同原先 HRWSI+官方 VKITTI 标签协议的主表。
+完整指标定义、失败规则与模型表示要求见 [SCOE 指南](doc/sky_eval.md)。
+
 ## 🏋️ Training
 
 Based on the previously created environment, install extended requirements:
@@ -306,11 +464,14 @@ DA2 input normalization or the conversion to the project's depth range.
 
 ### Paper ablations and evaluation
 
-The [ablation guide](config/ablation/README.md) maps all eleven configurations to
-the paper tables and provides training and evaluation commands. All ablations
-share progressive sampling and are evaluated on NYUv2 and KITTI. Only the full
-model is additionally evaluated on ETH3D, ScanNet, and DIODE for the main table.
-`script/eval_ablations.py` runs this plan and exports paper-scale metrics to CSV.
+The fifteen YAML files in `config/ablation/` map to Tables III and IV for manual
+experiments. N2 (`N2_no_terminal_noise_fade.yaml`) sets
+`diffusion_schedule.terminal_noise_fade_enabled=false`: structured noise no
+longer fades near the endpoint, while exact final-step Gaussian matching,
+zero-terminal-SNR and trailing DDIM remain enabled. When this flag is omitted,
+fading follows `terminal_noise_alignment`, preserving the Full and ID 03 settings.
+The two 8-channel configs require manual architecture changes; the table runners
+and automatic evaluation remain removed.
 
 New checkpoints include `inference_settings.json`, which restores DA2 settings
 and the conditioning switch automatically during inference. Existing checkpoints

@@ -1,0 +1,24 @@
+# Copy the models mapping into sky_eval.generated.yaml BEFORE audit.
+# Replace every placeholder with the actual depth-model inference record.
+# This describes the DEPTH model. Mask2Former provenance is recorded separately.
+models:
+  celeste_full:
+    root: output/sky_predictions/celeste_full
+    layout: infer_split  # <root>/<dataset>/<RGB relative parent>/pred_<RGB stem>.npy
+    checkpoint: REPLACE_WITH_ACTUAL_LOCAL_DEPTH_CHECKPOINT
+    inference_command: REPLACE_WITH_ACTUAL_COMMANDS_FOR_ALL_THREE_SPLITS
+    git_commit: REPLACE_WITH_INFERENCE_COMMIT
+    seed: 2024
+    resolution: original_full_frame
+    denoise_steps: 50
+    ensemble_size: 1
+    scheduler: REPLACE_WITH_MATCHING_SCHEDULER_AND_HASH
+    inference_config: REPLACE_WITH_ACTUAL_CHECKPOINT_INFERENCE_SETTINGS
+    native_postprocessing: pipeline clips depth to [0,1]; evaluator applies no extra clipping
+    representation: relative_depth
+    distance_direction: larger_is_farther
+    semantics_source: REPLACE_WITH_VERIFIED_MODEL_OUTPUT_CONVENTION
+    amplitude_comparability_verified: false
+    geometry: full_frame
+    resampling: reject
+    squeeze_leading_channel: false

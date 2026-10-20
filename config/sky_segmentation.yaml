@@ -1,0 +1,28 @@
+# Full-frame RGB only. All data paths below are relative to BASE_DATA_DIR.
+# No model/data downloads: checkpoint must be an existing local Transformers folder.
+model:
+  checkpoint: null
+  sky_labels: [sky]  # Resolved from model.config.id2label, never a hard-coded class ID.
+  device: auto
+  seed: 2024
+
+datasets:
+  vkitti2:
+    dataset_config: config/dataset/data_vkitti_val.yaml
+    train_list: data_split/vkitti/vkitti_train.txt
+    data_dir: null  # Optional authoritative path relative to BASE_DATA_DIR.
+    directory_fallbacks: [vkitti/vkitti_rgb, vkitti]
+  kitti:
+    dataset_config: config/dataset/data_kitti_eigen_test.yaml
+    data_dir: null
+    directory_fallbacks: [kitti/kitti_eigen_split_test, kitti]
+  diode:
+    dataset_config: config/dataset/data_diode_all.yaml
+    data_dir: null
+    directory_fallbacks: [diode/diode_val, diode]
+
+# This holds metadata/configs/previews only. Masks are written to:
+# <RGB directory, or tar parent>/sky_masks/<output_dir basename>/<RGB relative path>.sky.png
+# Supply existing list(s) with --data_split; dataset_config only supplies the dataset's loading defaults.
+output_dir: output/sky_segmentation/mask2former_v1
+preview_count: 50
