@@ -48,7 +48,6 @@ if "__main__" == __name__:
     parser = argparse.ArgumentParser(
         description="Run single-image depth estimation using Marigold."
     )
-    # 这个模型可能在.cache下的那个margold里面，反正替换那个就行了
     parser.add_argument(
         "--checkpoint",
         type=str,
@@ -70,6 +69,10 @@ if "__main__" == __name__:
         type=str,
         default="/root/Dataset",
         help="Path to base data directory.",
+    )
+    parser.add_argument(
+        "--sky_mask_name",
+        help="Use images in this split that have masks under the dataset's sky_masks/<name>/ directory.",
     )
 
     parser.add_argument(
@@ -176,7 +179,8 @@ if "__main__" == __name__:
                 print("Invalid input. Please enter 'y' (for Yes) or 'n' (for No).")
                 check_directory(directory)  # Recursive call to ask again
 
-    check_directory(output_dir)
+    if not args.sky_mask_name:
+        check_directory(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     logging.info(f"output dir = {output_dir}")
 
@@ -190,10 +194,20 @@ if "__main__" == __name__:
 
     # -------------------- Data --------------------
     cfg_data = OmegaConf.load(dataset_config)
+    if args.sky_mask_name and cfg_data.name in ("vkitti", "kitti"):
+        # Generated sky masks cover the original RGB frame, before benchmark cropping.
+        cfg_data.kitti_bm_crop = False
+        cfg_data.valid_mask_crop = None
 
     dataset: BaseDepthDataset = get_dataset(
         cfg_data, base_data_dir=base_data_dir, mode=DatasetMode.RGB_ONLY
     )
+    if args.sky_mask_name:
+        from src.sky_eval.direct import mask_root, select_masked_files
+
+        root = mask_root(base_data_dir, cfg_data.dir, args.sky_mask_name)
+        selected, skipped = select_masked_files(dataset, root)
+        logging.info("Sky masks: %s; infer %d images, skip %d without masks", root, selected, skipped)
 
     dataloader = DataLoader(dataset, batch_size=1, num_workers=0)
 

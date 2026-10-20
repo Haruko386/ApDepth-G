@@ -1,7 +1,7 @@
 """Local-only Mask2Former sky pseudo-label generation for evaluation splits."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
 from typing import Any, Protocol as TypingProtocol
@@ -17,11 +17,10 @@ import numpy as np
 from PIL import Image
 import yaml
 
-from .datasets import VKITTI_KEY
-from .rgb_io import RGBSource, normalized_relative
-from .schemas import Protocol, Sample, confined, object_hash, sha256, write_json
+from src.sky_eval.rgb_io import RGBSource, normalized_relative
+from src.sky_eval.schemas import confined, object_hash, sha256, write_json
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 MASK_SOURCE = "mask2former_pseudo_semantic_sky"
 
 
@@ -200,23 +199,6 @@ class Mask2FormerSky:
         return np.isin(labels, self.ids)
 
 
-def sample_for(plan: SplitPlan, relative: str, digest: str, mask_digest: str,
-               mask: np.ndarray, provenance: str, mask_prefix: str = "masks") -> Sample:
-    identity: dict[str, str] = {}
-    sid = f"{plan.dataset}/{relative}"
-    if plan.dataset == "vkitti2":
-        match = VKITTI_KEY.search(relative)
-        if match is None:
-            raise ValueError(f"Invalid VKITTI RGB path: {relative}")
-        scene, variation, camera, frame = match.groups()
-        identity = dict(scene_id=scene, variation=variation, camera=camera, frame_id=frame)
-        sid = f"vkitti2/{scene}/{variation}/{camera}/{frame}"
-    return Sample(sample_id=sid, dataset=plan.dataset, split=plan.split_name, rgb_path=relative,
-                  sky_mask_path=f"{mask_prefix}/{relative}.sky.png", mask_source=MASK_SOURCE,
-                  split_provenance=provenance, width=mask.shape[1], height=mask.shape[0],
-                  sky_ratio=float(mask.mean()), rgb_sha256=digest, mask_sha256=mask_digest, **identity)
-
-
 def save_overlay(image: Image.Image, mask: np.ndarray, path: Path) -> None:
     rgb = np.asarray(image).copy()
     rgb[mask] = (0.55 * rgb[mask] + 0.45 * np.array([40, 170, 255])).astype(np.uint8)
@@ -228,7 +210,7 @@ def save_overlay(image: Image.Image, mask: np.ndarray, path: Path) -> None:
 
 def generate(plans: list[SplitPlan], segmenter: Segmenter, output: Path,
              config: dict[str, Any], preview_count: int, limited: bool) -> int:
-    """All selected images are recorded. Any failure prevents SCOE-config export."""
+    """Write masks beside each dataset and a processing summary."""
     if output.exists():
         raise FileExistsError(f"Output already exists; choose a new --output_dir: {output}")
     destinations = [mask_location(plan, output)[1] for plan in plans]
@@ -252,11 +234,8 @@ def generate(plans: list[SplitPlan], segmenter: Segmenter, output: Path,
     write_json(output / "run_metadata.json", dict(config=config, model=segmenter.provenance,
                environment=versions, limited=limited, mask_values={"sky": 255, "non_sky": 0},
                repository_commit=commit, invocation=sys.argv,
-               source_hashes={p.name: sha256(p) for p in [Path(__file__), Path(__file__).with_name("rgb_io.py"),
-                                                         REPO / "script/segment_sky.py"]}))
-    evaluation: dict[str, Any] = dict(protocol=asdict(Protocol()), datasets={}, models={},
-                                     cross_dataset_duplicate_reviewed=False,
-                                     output=dict(root=str(output / "evaluation"), run_id="scoe_mask2former_v1"))
+               source_hashes={p.name: sha256(p) for p in [Path(__file__), REPO / "src/sky_eval/rgb_io.py",
+                                                         REPO / "script/dataset_preprocess/sky_mask/segment_sky.py"]}))
     summary: dict[str, Any] = {"status": "complete", "datasets": {}, "mask_source": MASK_SOURCE, "limited": limited}
     for plan in plans:
         logging.info("Segmenting %s: %d/%d images from %s", plan.dataset, len(plan.paths), plan.total, plan.source)
@@ -276,14 +255,12 @@ def generate(plans: list[SplitPlan], segmenter: Segmenter, output: Path,
         if (plan.split_sha256 and split_digest != plan.split_sha256) or (
                 plan.dataset_config_sha256 and config_digest != plan.dataset_config_sha256):
             raise ValueError(f"Dataset config or split changed after indexing: {plan.dataset}")
-        provenance = f"{plan.split_name}; list={plan.split_list}; sha256={split_digest}"
         records = folder / "per_image.jsonl"
-        manifest = folder / "manifest.jsonl"
-        with RGBSource(plan.source) as source, records.open("x", encoding="utf-8") as log, manifest.open("x", encoding="utf-8") as index:
+        with RGBSource(plan.source) as source, records.open("x", encoding="utf-8") as log:
             for number, relative in enumerate(plan.paths):
                 record: dict[str, Any] = dict(rgb_path=relative, status="failed", failure_reason=None)
                 try:
-                    image, digest = source.read(relative)
+                    image = source.read(relative)
                     mask = segmenter.predict(image)
                     if mask.dtype != np.bool_ or mask.shape != (image.height, image.width):
                         raise ValueError("Segmenter returned an invalid binary mask or wrong dimensions")
@@ -291,24 +268,20 @@ def generate(plans: list[SplitPlan], segmenter: Segmenter, output: Path,
                     mask_path.parent.mkdir(parents=True, exist_ok=True)
                     with mask_path.open("xb") as stream:
                         Image.fromarray(mask.astype(np.uint8) * 255).save(stream, format="PNG")
-                    sample = sample_for(plan, relative, digest, sha256(mask_path), mask, provenance, mask_prefix)
-                    index.write(json.dumps(sample.to_dict(), ensure_ascii=False) + "\n")
                     counts["succeeded"] += 1
                     counts["zero_sky"] += int(not mask.any())
                     counts["at_least_five_percent_sky"] += int(mask.mean() >= 0.05)
-                    record.update(sample.to_dict(), status="ok")
+                    record.update(status="ok", mask_path=str(mask_path), sky_ratio=float(mask.mean()))
                     if number in selected_previews:
-                        save_overlay(image, mask, previews / f"{object_hash(sample.sample_id)}.png")
+                        save_overlay(image, mask, previews / f"{object_hash(relative)}.png")
                 except (OSError, ValueError, RuntimeError) as exc:
-                    # CUDA/model failures must not silently produce a shorter evaluation split.
                     if record["status"] == "ok":
-                        raise  # A preview/output failure after manifest publication aborts this run.
+                        raise
                     counts["failed"] += 1
                     record["failure_reason"] = str(exc)
                     logging.error("%s/%s: %s", plan.dataset, relative, exc)
                 log.write(json.dumps(record, ensure_ascii=False) + "\n")
                 log.flush()
-                index.flush()
                 if (number + 1) % 25 == 0 or number + 1 == len(plan.paths):
                     logging.info("%s: %d/%d, failures=%d", plan.dataset, number + 1, len(plan.paths), counts["failed"])
         if sha256(plan.split_list) != split_digest:
@@ -319,44 +292,16 @@ def generate(plans: list[SplitPlan], segmenter: Segmenter, output: Path,
                       rgb_root=str(plan.source), split_list=str(plan.split_list), split_list_sha256=split_digest,
                       mask_root=str(mask_root), mask_directory=str(mask_directory),
                       dataset_config=str(plan.dataset_config), dataset_config_sha256=config_digest,
-                      manifest_sha256=sha256(manifest), per_image_sha256=sha256(records),
+                      per_image_sha256=sha256(records),
                       run_metadata_sha256=sha256(output / "run_metadata.json"))
         write_json(folder / "segmentation_report.json", report)
-        # A separate full-frame config reuses infer.py without editing benchmark configs.
-        raw_lines = plan.split_list.read_text(encoding="utf-8-sig").splitlines()
-        source_lines = {normalized_relative(line.split()[0]): line for line in raw_lines
-                        if line.strip() and not line.lstrip().startswith("#")}
-        inference_files = folder / "depth_inference_files.txt"
-        with inference_files.open("x", encoding="utf-8") as stream:
-            stream.write("\n".join(source_lines[path] for path in plan.paths) + "\n")
-        inference_config = yaml.safe_load(plan.dataset_config.read_text(encoding="utf-8-sig"))
-        # Legacy infer.py does not skip comments/blank lines; a snapshot keeps
-        # the exact selected data rows while leaving the user's source untouched.
-        use_snapshot = limited or any(not line.strip() or line.lstrip().startswith("#") for line in raw_lines)
-        inference_config.update(dir=str(plan.source), filenames=str(inference_files if use_snapshot else plan.split_list),
-                                disp_name=f"{plan.split_name}_sky_full_frame")
-        if plan.dataset in ("vkitti2", "kitti"):
-            inference_config.update(kitti_bm_crop=False, valid_mask_crop=None)
-        with (folder / "depth_inference.yaml").open("x", encoding="utf-8") as stream:
-            yaml.safe_dump(inference_config, stream, allow_unicode=True, sort_keys=False)
         summary["datasets"][plan.dataset] = {**counts, "data_split": str(plan.split_list),
                                                "mask_directory": str(mask_directory)}
         if counts["failed"]:
             summary["status"] = "failed"
-        entry = dict(enabled=True, mask_format="binary_manifest", rgb_root=str(plan.source), mask_root=str(mask_root),
-                     data_split=str(plan.split_list),
-                     manifest=str(manifest), segmentation_report=str(folder / "segmentation_report.json"),
-                     sky_values=[255], non_sky_values=[0], split_provenance=provenance,
-                     mask_provenance=f"Mask2Former pseudo labels; see {output / 'run_metadata.json'}", qa_reviewed=False)
-        if plan.dataset == "vkitti2":
-            train_list = config["datasets"]["vkitti2"]["train_list"]
-            entry.update(train_list=str(repository_path(train_list)), test_list=str(plan.split_list))
-        evaluation["datasets"][plan.dataset] = entry
     write_json(output / "summary.json", summary)
     if summary["status"] != "complete":
-        logging.error("Segmentation incomplete: no sky_eval.generated.yaml exported; inspect per_image.jsonl")
+        logging.error("Segmentation incomplete; inspect per_image.jsonl")
         return 2
-    with (output / "sky_eval.generated.yaml").open("x", encoding="utf-8") as stream:
-        yaml.safe_dump(evaluation, stream, allow_unicode=True, sort_keys=False)
-    logging.info("Masks and SCOE diagnostic configuration written to %s", output)
+    logging.info("Masks and segmentation summary written to %s", output)
     return 0

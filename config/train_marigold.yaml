@@ -5,7 +5,6 @@ base_config:
 # - config/dataset/data_vkitti_val.yaml
 - config/dataset/dataset_train.yaml
 - config/dataset/dataset_val.yaml
-# 下面这个可视化可以不要
 # - config/dataset/dataset_vis.yaml
 - config/model_sdv2.yaml
 - config/da2.yaml
@@ -55,7 +54,6 @@ multi_res_noise:
 gt_depth_type: depth_raw_norm
 gt_mask_type: valid_mask_raw
 
-# 建议这个数字不要再动
 max_epoch: 10000  # a large enough number to ensure convergence
 max_iter: 8000 # optimizer updates; effective batch 42 (7 x 6)
 

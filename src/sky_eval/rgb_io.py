@@ -1,12 +1,9 @@
 """Read full-frame RGB from a directory or tar archive without extraction."""
 from __future__ import annotations
 
-from collections import OrderedDict
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from types import TracebackType
-import atexit
-import hashlib
 import tarfile
 
 from PIL import Image
@@ -53,7 +50,7 @@ class RGBSource:
         key = normalized_relative(relative)
         return key in self.members if self.archive else confined(self.root, key).is_file()
 
-    def read(self, relative: str) -> tuple[Image.Image, str]:
+    def read(self, relative: str) -> Image.Image:
         key = normalized_relative(relative)
         if self.archive:
             if key not in self.members:
@@ -69,7 +66,7 @@ class RGBSource:
             # Match the existing loader's pixel coordinates: no EXIF rotation/crop.
             rgb = image.convert("RGB")
             rgb.load()
-        return rgb, hashlib.sha256(data).hexdigest()
+        return rgb
 
     def close(self) -> None:
         if self.archive:
@@ -82,32 +79,3 @@ class RGBSource:
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None,
                  traceback: TracebackType | None) -> None:
         self.close()
-
-
-_SOURCES: OrderedDict[tuple[str, int, int], RGBSource] = OrderedDict()
-
-
-def close_rgb_sources() -> None:
-    while _SOURCES:
-        _, source = _SOURCES.popitem(last=False)
-        source.close()
-
-
-def read_rgb(root: Path, relative: str) -> tuple[Image.Image, str]:
-    """Bounded archive cache; reopen when the archive's size/mtime changes."""
-    resolved = root.resolve()
-    if resolved.is_dir():
-        with RGBSource(resolved) as source:
-            return source.read(relative)
-    stat = resolved.stat()
-    key = (str(resolved), stat.st_mtime_ns, stat.st_size)
-    if key not in _SOURCES:
-        if len(_SOURCES) >= 3:
-            _, previous = _SOURCES.popitem(last=False)
-            previous.close()
-        _SOURCES[key] = RGBSource(resolved)
-    _SOURCES.move_to_end(key)
-    return _SOURCES[key].read(relative)
-
-
-atexit.register(close_rgb_sources)

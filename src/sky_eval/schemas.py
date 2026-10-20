@@ -1,7 +1,7 @@
-"""Validated protocol and portable manifest contracts."""
+"""Sky metric settings and file helpers."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import hashlib
@@ -40,33 +40,8 @@ class Protocol:
             raise ValueError("Invalid max_failure_fraction")
 
 
-@dataclass(frozen=True)
-class Sample:
-    sample_id: str
-    dataset: str
-    split: str
-    rgb_path: str
-    sky_mask_path: str
-    mask_source: str
-    split_provenance: str
-    scene_id: str | None = None
-    variation: str | None = None
-    camera: str | None = None
-    frame_id: str | None = None
-    colors_path: str | None = None
-    width: int = 0
-    height: int = 0
-    sky_ratio: float = 0.0
-    rgb_sha256: str = ""
-    mask_sha256: str = ""
-    colors_sha256: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
 def confined(root: Path, relative: str) -> Path:
-    """Reject path traversal and accidental absolute paths in manifests."""
+    """Reject path traversal and accidental absolute paths."""
     candidate = Path(relative)
     if candidate.is_absolute() or ".." in candidate.parts:
         raise ValueError(f"Expected portable relative path: {relative}")

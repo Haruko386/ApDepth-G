@@ -5,6 +5,8 @@ indent.log
 __pycache__/
 *.py[cod]
 
+failed.md
+
 venv/
 .env
 

@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 
 sys.dont_write_bytecode = True
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -30,7 +30,9 @@ def main(argv: list[str] | None = None) -> int:
         import tarfile
         import yaml
         from src.sky_eval.rgb_io import RGBSource
-        from src.sky_eval.segmentation import Mask2FormerSky, generate, make_plans, mask_location, repository_path, resolve_splits
+        from script.dataset_preprocess.sky_mask.segmentation import (
+            Mask2FormerSky, generate, make_plans, mask_location, repository_path, resolve_splits,
+        )
 
         if not args.base_data_dir:
             raise ValueError("Set BASE_DATA_DIR or pass --base_data_dir")

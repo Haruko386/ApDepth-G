@@ -21,7 +21,6 @@
 import argparse
 import logging
 import os
-import json
 
 import numpy as np
 import torch
@@ -84,6 +83,10 @@ if "__main__" == __name__:
         required=True,
         help="Path to base data directory.",
     )
+    parser.add_argument(
+        "--sky_mask_name",
+        help="Evaluate sky using masks in the dataset's sky_masks/<name>/ directory.",
+    )
 
     # LS depth alignment
     parser.add_argument(
@@ -124,6 +127,20 @@ if "__main__" == __name__:
 
     # -------------------- Data --------------------
     cfg_data = OmegaConf.load(dataset_config)
+
+    if args.sky_mask_name:
+        from src.sky_eval.direct import evaluate_sky, mask_root, select_masked_files
+
+        if cfg_data.name in ("vkitti", "kitti"):
+            cfg_data.kitti_bm_crop = False
+            cfg_data.valid_mask_crop = None
+        dataset = get_dataset(cfg_data, base_data_dir=base_data_dir, mode=DatasetMode.RGB_ONLY)
+        root = mask_root(base_data_dir, cfg_data.dir, args.sky_mask_name)
+        selected, skipped = select_masked_files(dataset, root)
+        logging.info("Sky masks: %s; evaluate %d images, skip %d without masks", root, selected, skipped)
+        result_path = evaluate_sky(dataset, root, prediction_dir, output_dir)
+        print(result_path.read_text(encoding="utf-8"))
+        raise SystemExit(0)
 
     dataset: BaseDepthDataset = get_dataset(
         cfg_data, base_data_dir=base_data_dir, mode=DatasetMode.EVAL
@@ -282,13 +299,3 @@ if "__main__" == __name__:
     with open(_save_to, "w+") as f:
         f.write(eval_text)
         logging.info(f"Evaluation metrics saved to {_save_to}")
-    with open(os.path.join(output_dir, "metrics.json"), "w", encoding="utf-8") as f:
-        result = {"dataset": dataset.disp_name, "samples": len(dataset),
-                  "alignment": alignment, "metrics": metric_tracker.result()}
-        if cfg_data.name == "diode":
-            result["evaluation_mask"] = {
-                "protocol": "ppd_diode", "depth_range_m": [0.6, 350.0],
-                "sobel_input": "raw_metric_gt", "sobel_norm": "l1",
-                "sobel_threshold": DIODE_SOBEL_THRESHOLD,
-            }
-        json.dump(result, f, indent=2)
