@@ -26,6 +26,7 @@ def checkpoint_inference_settings(unet_checkpoint):
             )
         cfg = OmegaConf.load(config_path)
         settings = {
+            "backbone": cfg.get("model", {}).get("backbone", "sd2"),
             "da2_conditioning_enabled": cfg.get("da2_conditioning_enabled", True),
             "da2_config": OmegaConf.to_container(cfg.da2, resolve=True) if cfg.get("da2") is not None else None,
             "diffusion_schedule": OmegaConf.to_container(cfg.diffusion_schedule, resolve=True)
@@ -54,9 +55,27 @@ def apply_model_overrides(pipe, unet_checkpoint=None):
     if unet_checkpoint:
         path = Path(unet_checkpoint)
         settings = checkpoint_inference_settings(path)
+        expected_backbone = settings.get("backbone")
+        actual_backbone = getattr(pipe, "depth_backbone", None)
+        if expected_backbone and actual_backbone and expected_backbone != actual_backbone:
+            raise ValueError(f"U-Net backbone mismatch: checkpoint is {expected_backbone}, selected {actual_backbone}")
         unet = UNet2DConditionModel.from_pretrained(path / "unet", torch_dtype=pipe.unet.dtype)
-        if unet.config.in_channels != 12:
-            raise ValueError("Expected a trained 12-channel VGC U-Net")
+        if unet.config.in_channels not in (8, 12):
+            raise ValueError("Expected a trained 8- or 12-channel depth U-Net")
+        if unet.config.in_channels == 8 and settings["da2_conditioning_enabled"]:
+            raise ValueError("8-channel checkpoint cannot use DA2 input conditioning")
+        if settings.get("unet_in_channels", unet.config.in_channels) != unet.config.in_channels:
+            raise ValueError("Checkpoint input channels disagree with inference settings")
+        if unet.config.get("addition_embed_type") != pipe.unet.config.get("addition_embed_type"):
+            raise ValueError("U-Net backbone mismatch: select --backbone matching the checkpoint")
+        # SSD and full SDXL share text_time, but their U-Net layouts differ.
+        for key in ("block_out_channels", "down_block_types", "up_block_types",
+                    "mid_block_type", "transformer_layers_per_block",
+                    "reverse_transformer_layers_per_block", "cross_attention_dim"):
+            actual = json.loads(json.dumps(unet.config.get(key)))
+            expected = json.loads(json.dumps(pipe.unet.config.get(key)))
+            if actual != expected:
+                raise ValueError(f"U-Net backbone mismatch: {key} differs from the base checkpoint")
         pipe.unet = unet
         scheduler_path = path / "scheduler"
         if not scheduler_path.is_dir():

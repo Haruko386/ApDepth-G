@@ -21,6 +21,12 @@ bash script/eval/0_infer_eval_all_sky.sh
 
 Only if masks have **not** been generated, use a local Mask2Former checkpoint once:
 
+For the SSD branch, also set `BACKBONE=ssd`, point `CHECKPOINT` to the local
+`SSD-1B` base and `CELESTE_CHECKPOINT` to its trained depth checkpoint. Use separate
+`SKY_PREDICTION_ROOT` and `SKY_EVAL_ROOT` directories for SSD results. Alternatively,
+use `python script/eval_ssd.py --sky_mask_name mask2former_v1`; see the
+[SSD README](../../../README.md#sky-masks-and-sky-metrics) for complete commands.
+
 ```bash
 python -B script/dataset_preprocess/sky_mask/segment_sky.py \
   --base_data_dir "$BASE_DATA_DIR" \

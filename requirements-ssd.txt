@@ -1,0 +1,24 @@
+# Add-ons for the SSD-1B branch; retain the existing CUDA-enabled PyTorch.
+# CPU integration tested with torch 2.4.1, diffusers 0.35.2, transformers 4.57.0.
+diffusers>=0.35.2,<0.36
+transformers>=4.46,<5
+accelerate>=0.34,<2
+safetensors>=0.4
+bitsandbytes>=0.45.5,<0.51
+
+# Shared training/inference/evaluation runtime (torch/torchvision supplied by
+# the user's CUDA environment; xformers is not required for the SSD path).
+numpy
+Pillow
+matplotlib
+scipy
+omegaconf
+pandas
+tabulate
+h5py
+opencv-python
+tensorboard
+wandb
+tqdm
+huggingface-hub>=0.34,<1
+PyYAML

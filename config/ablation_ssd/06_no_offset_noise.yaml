@@ -1,0 +1,5 @@
+base_config:
+- config/train_ssd.yaml
+
+# 移除逐通道 offset noise。
+offset_noise_strength: 0.0

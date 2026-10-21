@@ -1,0 +1,9 @@
+base_config:
+- config/train_ssd.yaml
+
+# Table III: genuine RGB(4) + noisy-depth(4) input; no DA2 conditioning or VGC.
+# Initialize from the original 4ch base by repeating weights twice / 2, bias copied.
+unet_in_channels: 8
+da2_conditioning_enabled: false
+validity_guided_completion:
+  enabled: false

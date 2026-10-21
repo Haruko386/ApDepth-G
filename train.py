@@ -53,6 +53,7 @@ from src.util.logging_util import (
     tb_logger,
 )
 from src.util.slurm_util import get_local_scratch_dir, is_on_slurm
+from src.util.pipeline_loader import load_depth_pipeline
 
 if "__main__" == __name__:
     t_start = datetime.now()
@@ -63,7 +64,7 @@ if "__main__" == __name__:
     parser.add_argument( 
         "--config",
         type=str,
-        default="Marigold/config/train_marigold.yaml",
+        default="config/train_ssd.yaml",
         help="Path to config file.",
     )
     parser.add_argument(
@@ -76,6 +77,8 @@ if "__main__" == __name__:
         "--output_dir", type=str, default=None, help="directory to save checkpoints"
     )
     parser.add_argument("--no_cuda", action="store_true", help="Do not use cuda.")
+    parser.add_argument("--fp16", "--half_precision", action="store_true",
+                        help="Enable FP16 AMP training; default is FP32, including resume.")
     parser.add_argument(
         "--exit_after",
         type=int,
@@ -147,6 +150,9 @@ if "__main__" == __name__:
             out_dir_run = os.path.join("./output", job_name)
         os.makedirs(out_dir_run, exist_ok=False)
 
+    # Precision is an explicit invocation choice, also when resuming. Never
+    # silently inherit FP16/BF16 from an older saved run configuration.
+    cfg.trainer.mixed_precision = "fp16" if args.fp16 else "no"
     cfg_data = cfg.dataset
 
     # Other directories
@@ -197,7 +203,6 @@ if "__main__" == __name__:
     # -------------------- Device --------------------
     cuda_avail = torch.cuda.is_available() and not args.no_cuda
     device = torch.device("cuda" if cuda_avail else "cpu")
-    # device = "cpu"
     logging.info(f"device = {device}")
 
     # -------------------- Snapshot of code and config --------------------
@@ -266,7 +271,20 @@ if "__main__" == __name__:
         depth_transform=depth_transform,
     )
     logging.debug("Augmentation: ", cfg.augmentation)
-    if "mixed" == cfg_data.train.name:
+    if cfg.trainer.get("memory_probe", False):
+        # Alternate real samples from every dataset. Batch one supports distinct
+        # HyperSim / VKITTI shapes and probes both with allocated optimizer state.
+        dataset_ls = train_dataset if isinstance(train_dataset, list) else [train_dataset]
+        concat_dataset = ConcatDataset(dataset_ls)
+        offsets, offset = [], 0
+        for dataset in dataset_ls:
+            offsets.append(offset)
+            offset += len(dataset)
+        subset = torch.utils.data.Subset(concat_dataset, offsets * 2)
+        if cfg.dataloader.max_train_batch_size != 1 or accumulation_steps != len(dataset_ls):
+            raise ValueError("Memory probe requires batch 1 and one accumulated sample per dataset")
+        train_loader = DataLoader(subset, batch_size=1, num_workers=0)
+    elif "mixed" == cfg_data.train.name:
         dataset_ls = train_dataset
         assert len(cfg_data.train.prob_ls) == len(
             dataset_ls
@@ -327,12 +345,14 @@ if "__main__" == __name__:
     #         num_workers=cfg.dataloader.num_workers,
     #     )
     #     vis_loaders.append(_vis_loader)
-     
+
+    # -------------------- Model --------------------
     _pipeline_kwargs = dict(cfg.pipeline.kwargs) if cfg.pipeline.kwargs is not None else {}
     if cfg.get("da2") is not None:
         _pipeline_kwargs["da2_config"] = OmegaConf.to_container(cfg.da2, resolve=True)
-    model = MarigoldPipeline.from_pretrained(
-        os.path.join(base_ckpt_dir, cfg.model.pretrained_path), **_pipeline_kwargs
+    model = load_depth_pipeline(
+        os.path.join(base_ckpt_dir, cfg.model.pretrained_path),
+        backbone=cfg.model.get("backbone", "sd2"), **_pipeline_kwargs
     )
 
     # -------------------- Trainer --------------------
@@ -368,3 +388,4 @@ if "__main__" == __name__:
         trainer.train(t_end=t_end)
     except Exception as e:
         logging.exception(e)
+        raise

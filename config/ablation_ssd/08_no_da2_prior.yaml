@@ -1,0 +1,8 @@
+base_config:
+- config/train_ssd.yaml
+
+# 12 通道结构保持不变，但 DA2 条件通道置零，同时关闭依赖 DA2 的 VGC。
+# 这是“移除全部 DA2 信息”的组合消融。
+da2_conditioning_enabled: false
+validity_guided_completion:
+  enabled: false

@@ -12,3 +12,9 @@ venv/
 
 .vscode/
 .idea/
+
+# Downloaded diffusion and auxiliary weights stay outside Git.
+checkpoint/
+checkpoints/
+*.safetensors
+*.pth

@@ -1,0 +1,6 @@
+base_config:
+- config/train_ssd.yaml
+
+# Remove only the mean anchor over U; retain smoothness and the far-field anchor.
+validity_guided_completion:
+  anchor_weight: 0.0

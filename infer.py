@@ -56,6 +56,7 @@ if "__main__" == __name__:
     )
 
     # dataset setting
+    parser.add_argument("--backbone", choices=["sd2", "sdxl", "ssd"], default="sd2")
     parser.add_argument("--unet_checkpoint", help="Original VGC checkpoint containing unet/")
     parser.add_argument("--da2_config", help="DA2 YAML config; defaults to config/da2.yaml for legacy models")
     parser.add_argument(
@@ -94,7 +95,7 @@ if "__main__" == __name__:
     )
     parser.add_argument(
         "--half_precision",
-        "--fp32",
+        "--fp16",
         action="store_true",
         help="Run with half-precision (16-bit float), might lead to suboptimal result.",
     )
@@ -214,7 +215,7 @@ if "__main__" == __name__:
     # -------------------- Model --------------------
     if half_precision:
         dtype = torch.float16
-        variant = "fp16"
+        variant = None  # Cast ordinary weights; no fp16 filenames required.
         logging.warning(
             f"Running with half precision ({dtype}), might lead to suboptimal result."
         )
@@ -222,8 +223,9 @@ if "__main__" == __name__:
         dtype = torch.float32
         variant = None
 
-    pipe = MarigoldPipeline.from_pretrained(
-        checkpoint_path, variant=variant, torch_dtype=dtype,
+    from src.util.pipeline_loader import load_depth_pipeline
+    pipe = load_depth_pipeline(
+        checkpoint_path, backbone=args.backbone, variant=variant, torch_dtype=dtype,
         **checkpoint_pipeline_kwargs(args.unet_checkpoint, args.da2_config),
     )
     apply_model_overrides(pipe, args.unet_checkpoint)
@@ -231,10 +233,11 @@ if "__main__" == __name__:
     # pipe.unet = unet
         
 
-    try:
-        pipe.enable_xformers_memory_efficient_attention()
-    except ImportError:
-        logging.debug("run without xformers")
+    if args.backbone == "sd2":
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+        except ImportError:
+            logging.debug("run without xformers")
 
     pipe = pipe.to(device)
     logging.info(

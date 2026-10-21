@@ -1,0 +1,5 @@
+base_config:
+- config/train_ssd.yaml
+
+# 使用标准高斯噪声，移除多分辨率噪声增强。
+multi_res_noise: null

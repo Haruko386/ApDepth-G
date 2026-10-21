@@ -24,6 +24,7 @@ import logging
 import json
 import os
 import shutil
+from contextlib import nullcontext
 from datetime import datetime
 from typing import List, Union
 
@@ -86,27 +87,56 @@ class MarigoldTrainer:
         self.vis_loaders: List[DataLoader] = vis_dataloaders
         self.accumulation_steps: int = accumulation_steps
 
-        # Adapt input layers. The method uses fixed 12-channel conditioning:
-        # RGB latent (4) + DA2 prior latent (4) + noisy depth latent (4).
-        if 12 != self.model.unet.config["in_channels"]:
-            self._replace_unet_conv_in()
+        # Full model: RGB + DA2 + noisy depth. Main's 8ch ablations omit DA2.
+        input_channels = int(cfg.get("unet_in_channels", 12))
+        if input_channels not in (8, 12):
+            raise ValueError("Depth training requires 8 or 12 input channels")
+        if input_channels == 8 and cfg.get("da2_conditioning_enabled", True):
+            raise ValueError("8-channel ablations require da2_conditioning_enabled=false")
+        if input_channels != self.model.unet.config["in_channels"]:
+            self._replace_unet_conv_in(input_channels)
 
         # Encode empty text prompt
         self.model.encode_empty_text()
         self.empty_text_embed = self.model.empty_text_embed.detach().clone().to(device)
 
-        self.model.unet.enable_xformers_memory_efficient_attention()
+        if cfg.trainer.get("use_xformers", True):
+            self.model.unet.enable_xformers_memory_efficient_attention()
+        if cfg.trainer.get("gradient_checkpointing", False):
+            self.model.unet.enable_gradient_checkpointing()
+        precision = cfg.trainer.get("mixed_precision", "no")
+        if precision not in ("no", "fp16"):
+            raise ValueError("Training supports FP32 or explicit FP16 AMP")
+        self.use_fp16 = precision == "fp16"
+        if self.use_fp16 and torch.device(device).type != "cuda":
+            raise ValueError("FP16 training requires CUDA; omit --fp16 to use FP32")
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_fp16)
+        logging.info("Training precision: %s", "FP16 AMP (FP32 master weights)" if self.use_fp16 else "FP32")
+        self.memory_probe = bool(cfg.trainer.get("memory_probe", False))
+        self.report_cuda_memory = bool(cfg.trainer.get("report_cuda_memory", False))
 
         # Trainability
         self.model.vae.requires_grad_(False)
-        self.model.text_encoder.requires_grad_(False)
+        if self.model.text_encoder is not None:
+            self.model.text_encoder.requires_grad_(False)
         self.model.unet.requires_grad_(True)
         self.model.da2.requires_grad_(False)
         self.model.da2.eval()
 
         # Optimizer !should be defined after input layer is adapted
         lr = self.cfg.lr
-        self.optimizer = Adam(self.model.unet.parameters(), lr=lr)
+        if cfg.optimizer.name == "Adam8bit":
+            if torch.device(device).type != "cuda":
+                raise ValueError("Adam8bit requires CUDA")
+            try:
+                from bitsandbytes.optim import Adam8bit
+            except ImportError as exc:
+                raise ImportError("Adam8bit requires bitsandbytes: pip install bitsandbytes") from exc
+            self.optimizer = Adam8bit(self.model.unet.parameters(), lr=lr)
+        elif cfg.optimizer.name == "Adam":
+            self.optimizer = Adam(self.model.unet.parameters(), lr=lr)
+        else:
+            raise ValueError(f"Unsupported optimizer: {cfg.optimizer.name}")
 
         # LR scheduler
         lr_func = IterExponential(
@@ -237,28 +267,24 @@ class MarigoldTrainer:
         self.in_evaluation = False
         self.global_seed_sequence: List = []  # consistent global seed sequence, used to seed random generator, to ensure consistency when resuming
 
-    # 12 channels
-    def _replace_unet_conv_in(self):
-        # replace the first layer to accept 12 in_channels
+    def _replace_unet_conv_in(self, input_channels=12):
+        if self.model.unet.config["in_channels"] != 4 or input_channels not in (8, 12):
+            raise ValueError("Initialize depth input from an original 4-channel base U-Net")
         _weight = self.model.unet.conv_in.weight.clone()  # [320, 4, 3, 3]
         _bias = self.model.unet.conv_in.bias.clone()      # [320]
-        _weight = _weight.repeat((1, 3, 1, 1))  
-
-        _weight *= (1.0 / 3.0)
+        repeats = input_channels // 4
+        _weight = _weight.repeat((1, repeats, 1, 1)) / repeats
         
         _n_convin_out_channel = self.model.unet.conv_in.out_channels
         _new_conv_in = Conv2d(
-            12, _n_convin_out_channel, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)
+            input_channels, _n_convin_out_channel, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)
         )
         _new_conv_in.weight = Parameter(_weight)
         _new_conv_in.bias = Parameter(_bias)
         self.model.unet.conv_in = _new_conv_in
         
-        logging.info("Unet conv_in layer is replaced to accept 12 channels")
-        
-        # replace config
-        self.model.unet.config["in_channels"] = 12
-        logging.info("Unet config is updated to 12 channels")
+        self.model.unet.register_to_config(in_channels=input_channels)
+        logging.info("Unet input adapted to %d channels", input_channels)
         return
 
     def train(self, t_end=None):
@@ -266,6 +292,8 @@ class MarigoldTrainer:
 
         device = self.device
         self.model.to(device)
+        if self.report_cuda_memory and torch.device(device).type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
 
         if self.in_evaluation:
             logging.info(
@@ -275,6 +303,7 @@ class MarigoldTrainer:
 
         self.train_metrics.reset()
         accumulated_step = 0
+        pending_batches = []
         mixed_sampler = self.train_loader.batch_sampler
         if not isinstance(mixed_sampler, MixedBatchSampler):
             mixed_sampler = None
@@ -298,230 +327,12 @@ class MarigoldTrainer:
                     for name in batch["dataset_name"]:
                         mixture_counts[name] += 1
 
-                # globally consistent random generators
-                if self.seed is not None:
-                    local_seed = self._get_next_seed()
-                    rand_num_generator = torch.Generator(device=device)
-                    rand_num_generator.manual_seed(local_seed)
-                else:
-                    rand_num_generator = None
-
-                # >>> With gradient accumulation >>>
-
-                # Get data
-                rgb = batch["rgb_norm"].to(device)
-                depth_gt_for_latent = batch[self.gt_depth_type].to(device)
-                with torch.no_grad():
-                    # rgb is ApDepth [-1, 1]. infer_batch converts it to DA2's
-                    # [0, 1] + ImageNet-normalized DINOv2 input, then returns
-                    # near=-1/far=+1 depth in the SD2 VAE input range.
-                    da2_depth = self.model.da2.infer_batch(rgb).to(device)
-                    da2_far_pixels = (
-                        da2_depth[:, :1] >= self.vgc_far_depth_threshold
-                    )
-
-                if self.gt_mask_type is not None:
-                    valid_mask_for_latent = batch[self.gt_mask_type].to(device)
-                    valid_mask_down, invalid_mask_down = latent_validity_masks(
-                        valid_mask_for_latent
-                    )
-                    # A DA2-far latent cell is selected only if its entire 8x8
-                    # source block is far. Mixed sky/object boundary cells are
-                    # excluded instead of being smoothed across the boundary.
-                    da2_far_mask_down, _ = latent_validity_masks(da2_far_pixels)
-                    valid_mask_down = valid_mask_down.repeat((1, 4, 1, 1))
-                    invalid_mask_down = invalid_mask_down.repeat((1, 4, 1, 1))
-                    da2_far_mask_down = da2_far_mask_down.repeat((1, 4, 1, 1))
-                    da2_far_mask_down = da2_far_mask_down & invalid_mask_down
-                else:
-                    raise NotImplementedError
-
-                batch_size = rgb.shape[0]
-
-                with torch.no_grad():
-                    # Encode image
-                    rgb_latent = self.model.encode_rgb(rgb)  # [B, 4, h, w]
-                    # Encode GT depth
-                    gt_depth_latent = self.encode_depth(
-                        depth_gt_for_latent
-                    )  # [B, 4, h, w]
-                    # infer_batch has already mapped raw DA2 disparity to
-                    # [-1, 1]; encode_rgb must never receive raw DA2 output.
-                    da2_depth_latent = self.model.encode_rgb(da2_depth)  # [B, 4, h, w]
-                
-                # Sample a random timestep for each image
-                timesteps = torch.randint(
-                    0,
-                    self.scheduler_timesteps,
-                    (batch_size,),
-                    device=device,
-                    generator=rand_num_generator,
-                ).long()  # [B]
-                if self.terminal_noise_fade_enabled:
-                    terminal_fade = terminal_noise_fade(
-                        timesteps,
-                        self.scheduler_timesteps,
-                        self.terminal_noise_fade_fraction,
-                    )
-                else:
-                    terminal_fade = torch.ones_like(timesteps, dtype=torch.float32)
-
-                if self.apply_multi_res_noise:
-                    strength = self.mr_noise_strength
-                    if self.annealed_mr_noise:
-                        strength = strength * (
-                            timesteps / max(self.scheduler_timesteps - 1, 1)
-                        )
-                    strength = strength * terminal_fade
-                    noise = multi_res_noise_like(
-                        gt_depth_latent,
-                        strength=strength,
-                        downscale_strategy=self.mr_noise_downscale_strategy,
-                        generator=rand_num_generator,
-                        device=device,
-                    )
-                else:
-                    noise = torch.randn(
-                        gt_depth_latent.shape,
-                        device=device,
-                        generator=rand_num_generator,
-                    )  # [B, 4, h, w]
-
-                # Multi-resolution noise is not a standard Gaussian at the last
-                # timestep. Match inference exactly at the pure-noise endpoint.
-                terminal = (timesteps == self.scheduler_timesteps - 1).view(-1, 1, 1, 1)
-                if (
-                    self.terminal_noise_alignment
-                    and self.apply_multi_res_noise
-                    and terminal.any()
-                ):
-                    standard_noise = torch.randn(
-                        gt_depth_latent.shape,
-                        device=device,
-                        generator=rand_num_generator,
-                    )
-                    noise = torch.where(terminal, standard_noise, noise)
-
-                terminal_standard_noise = noise
-                if self.offset_noise_strength > 0:
-                    offset_noise = torch.randn(
-                        batch_size, gt_depth_latent.shape[1], 1, 1,
-                        device=device,
-                        generator=rand_num_generator,
-                    ) * self.offset_noise_strength * terminal_fade.view(-1, 1, 1, 1)
-                    noise = noise + offset_noise
-                if self.terminal_noise_alignment:
-                    # N2 disables fading, but T-1 must still be standard
-                    # Gaussian: remove the offset augmentation at this endpoint.
-                    noise = torch.where(terminal, terminal_standard_noise, noise)
-
-                # Add noise to the latents (diffusion forward process)
-                noisy_latents = self.training_noise_scheduler.add_noise(
-                    gt_depth_latent, noise, timesteps
-                )  # [B, 4, h, w]
-
-                # Text embedding
-                text_embed = self.empty_text_embed.to(device).repeat(
-                    (batch_size, 1, 1)
-                )  # [B, 77, 1024]
-
-                # Concat rgb and depth latents
-                da2_condition_latent = (
-                    da2_depth_latent
-                    if self.da2_conditioning_enabled
-                    else torch.zeros_like(da2_depth_latent)
-                )
-                cat_latents = torch.cat(
-                    [rgb_latent, da2_condition_latent, noisy_latents], dim=1
-                )  # [B, 12, h, w]
-                cat_latents = cat_latents.float()
-
-                # Predict the noise residual
-                model_pred = self.model.unet(
-                    cat_latents, timesteps, text_embed
-                ).sample  # [B, 4, h, w]
-                
-                if torch.isnan(model_pred).any():
-                    logging.warning("model_pred contains NaN.")
-
-                # Get the target for loss depending on the prediction type
-                if "sample" == self.prediction_type:
-                    target = gt_depth_latent
-                elif "epsilon" == self.prediction_type:
-                    target = noise
-                elif "v_prediction" == self.prediction_type:
-                    target = self.training_noise_scheduler.get_velocity(
-                        gt_depth_latent, noise, timesteps
-                    )  # [B, 4, h, w]
-                else:
-                    raise ValueError(f"Unknown prediction type {self.prediction_type}")
-                
-                alphas_cumprod = self.training_noise_scheduler.alphas_cumprod.to(device)
-                alpha_prod_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
-                beta_prod_t = 1 - alpha_prod_t
-
-                if "v_prediction" == self.prediction_type:
-                    pred_x0 = (alpha_prod_t ** 0.5) * noisy_latents - (beta_prod_t ** 0.5) * model_pred
-                elif "epsilon" == self.prediction_type:
-                    pred_x0 = (noisy_latents - (beta_prod_t ** 0.5) * model_pred) / (alpha_prod_t ** 0.5)
-                else:
-                    pred_x0 = model_pred # sample type
-
-            
-                if self.min_snr_enabled:
-                    snr_weight = min_snr_weight(
-                        alpha_prod_t,
-                        self.prediction_type,
-                        self.min_snr_gamma,
-                        self.min_snr_floor,
-                    )
-                else:
-                    snr_weight = torch.ones_like(alpha_prod_t)
-
-                diff = model_pred.float() - target.float()
-                if "l1" in self.cfg.loss.name.lower():
-                    unreduced_loss = torch.abs(diff)
-                else:
-                    unreduced_loss = torch.square(diff)
-                
-                unreduced_loss = unreduced_loss * snr_weight
-
-                if self.gt_mask_type is not None:
-                    latent_loss = torch.where(valid_mask_down, unreduced_loss, 0.0).sum() / valid_mask_down.sum().clamp_min(1)
-                    grad_loss = self.latent_grad_loss(
-                        pred_x0.float(), 
-                        gt_depth_latent.float(), 
-                        valid_mask_down
-                    )
-                else:
-                    latent_loss = unreduced_loss
-                    grad_loss = self.latent_grad_loss(pred_x0.float(), gt_depth_latent.float())
-
-                loss = (
-                    latent_loss.mean()
-                    + self.latent_gradient_weight * grad_loss.mean()
-                )
-                vgc_loss = loss.new_zeros(())
-
-                if self.vgc_enabled:
-                    # VGC only supervises invalid-depth regions. This prevents the
-                    # regularizer from directly supervising valid pixels. Shared
-                    # U-Net parameters still require indoor regression evaluation.
-                    vgc_loss = self._validity_guided_completion_loss(
-                        pred_x0=pred_x0.float(),
-                        prior_latent=da2_depth_latent.float().detach(),
-                        invalid_mask=invalid_mask_down,
-                        far_mask=da2_far_mask_down,
-                    )
-                    loss = loss + vgc_loss
-
-                self.train_metrics.update("loss", loss.item())
-                self.train_metrics.update("diffusion_loss", latent_loss.mean().item())
-                self.train_metrics.update("latent_gradient_loss", grad_loss.mean().item())
-                self.train_metrics.update("completion_loss", vgc_loss.item())
-
-                loss = loss / self.gradient_accumulation_steps
-                loss.backward()
+                local_seed = self._get_next_seed() if self.seed is not None else None
+                if self.use_fp16:
+                    # Retain CPU inputs only, not activations. An overflow retry
+                    # reuses this same effective batch and its diffusion seeds.
+                    pending_batches.append((batch, local_seed))
+                self._backward_batch(batch, local_seed)
                 accumulated_step += 1
 
                 self.n_batch_in_epoch += 1
@@ -529,12 +340,13 @@ class MarigoldTrainer:
 
                 # Perform optimization step
                 if accumulated_step >= self.gradient_accumulation_steps:
-                    self.optimizer.step()
-                    self.lr_scheduler.step()
-                    self.optimizer.zero_grad()
+                    self._step_accumulated_gradients(pending_batches)
+                    pending_batches.clear()
                     accumulated_step = 0
 
                     self.effective_iter += 1
+                    if self.report_cuda_memory and torch.device(device).type == "cuda":
+                        self._report_memory()
 
                     if mixed_sampler is not None:
                         probabilities = mixed_sampler.probabilities_at(self.effective_iter - 1)
@@ -578,10 +390,11 @@ class MarigoldTrainer:
 
                     # End of training
                     if self.max_iter > 0 and self.effective_iter >= self.max_iter:
-                        self.save_checkpoint(
-                            ckpt_name=self._get_backup_ckpt_name(),
-                            save_train_state=False,
-                        )
+                        if not self.memory_probe:
+                            self.save_checkpoint(
+                                ckpt_name=self._get_backup_ckpt_name(),
+                                save_train_state=False,
+                            )
                         logging.info("Training ended.")
                         return
                     # Time's up
@@ -595,6 +408,282 @@ class MarigoldTrainer:
 
             # Epoch end
             self.n_batch_in_epoch = 0
+
+    def _backward_batch(self, batch, local_seed):
+        device = self.device
+        # globally consistent random generators
+        if local_seed is not None:
+            rand_num_generator = torch.Generator(device=device)
+            rand_num_generator.manual_seed(local_seed)
+        else:
+            rand_num_generator = None
+
+        # >>> With gradient accumulation >>>
+
+        # Get data
+        rgb = batch["rgb_norm"].to(device)
+        depth_gt_for_latent = batch[self.gt_depth_type].to(device)
+        with torch.no_grad():
+            # rgb is ApDepth [-1, 1]. infer_batch converts it to DA2's
+            # [0, 1] + ImageNet-normalized DINOv2 input, then returns
+            # near=-1/far=+1 depth in the SD2 VAE input range.
+            da2_depth = self.model.da2.infer_batch(rgb).to(device)
+            da2_far_pixels = (
+                da2_depth[:, :1] >= self.vgc_far_depth_threshold
+            )
+
+        if self.gt_mask_type is not None:
+            valid_mask_for_latent = batch[self.gt_mask_type].to(device)
+            valid_mask_down, invalid_mask_down = latent_validity_masks(
+                valid_mask_for_latent
+            )
+            # A DA2-far latent cell is selected only if its entire 8x8
+            # source block is far. Mixed sky/object boundary cells are
+            # excluded instead of being smoothed across the boundary.
+            da2_far_mask_down, _ = latent_validity_masks(da2_far_pixels)
+            valid_mask_down = valid_mask_down.repeat((1, 4, 1, 1))
+            invalid_mask_down = invalid_mask_down.repeat((1, 4, 1, 1))
+            da2_far_mask_down = da2_far_mask_down.repeat((1, 4, 1, 1))
+            da2_far_mask_down = da2_far_mask_down & invalid_mask_down
+        else:
+            raise NotImplementedError
+
+        batch_size = rgb.shape[0]
+
+        with torch.no_grad():
+            # Encode image
+            rgb_latent = self.model.encode_rgb(rgb)  # [B, 4, h, w]
+            # Encode GT depth
+            gt_depth_latent = self.encode_depth(
+                depth_gt_for_latent
+            )  # [B, 4, h, w]
+            # infer_batch has already mapped raw DA2 disparity to
+            # [-1, 1]; encode_rgb must never receive raw DA2 output.
+            da2_depth_latent = self.model.encode_rgb(da2_depth)  # [B, 4, h, w]
+
+        # Sample a random timestep for each image
+        timesteps = torch.randint(
+            0,
+            self.scheduler_timesteps,
+            (batch_size,),
+            device=device,
+            generator=rand_num_generator,
+        ).long()  # [B]
+        if self.terminal_noise_fade_enabled:
+            terminal_fade = terminal_noise_fade(
+                timesteps,
+                self.scheduler_timesteps,
+                self.terminal_noise_fade_fraction,
+            )
+        else:
+            terminal_fade = torch.ones_like(timesteps, dtype=torch.float32)
+
+        if self.apply_multi_res_noise:
+            strength = self.mr_noise_strength
+            if self.annealed_mr_noise:
+                strength = strength * (
+                    timesteps / max(self.scheduler_timesteps - 1, 1)
+                )
+            strength = strength * terminal_fade
+            noise = multi_res_noise_like(
+                gt_depth_latent,
+                strength=strength,
+                downscale_strategy=self.mr_noise_downscale_strategy,
+                generator=rand_num_generator,
+                device=device,
+            )
+        else:
+            noise = torch.randn(
+                gt_depth_latent.shape,
+                device=device,
+                generator=rand_num_generator,
+            )  # [B, 4, h, w]
+
+        # Multi-resolution noise is not a standard Gaussian at the last
+        # timestep. Match inference exactly at the pure-noise endpoint.
+        terminal = (timesteps == self.scheduler_timesteps - 1).view(-1, 1, 1, 1)
+        if (
+            self.terminal_noise_alignment
+            and self.apply_multi_res_noise
+            and terminal.any()
+        ):
+            standard_noise = torch.randn(
+                gt_depth_latent.shape,
+                device=device,
+                generator=rand_num_generator,
+            )
+            noise = torch.where(terminal, standard_noise, noise)
+
+        if self.offset_noise_strength > 0:
+            offset_noise = torch.randn(
+                batch_size, gt_depth_latent.shape[1], 1, 1,
+                device=device,
+                generator=rand_num_generator,
+            ) * self.offset_noise_strength * terminal_fade.view(-1, 1, 1, 1)
+            noise = noise + offset_noise
+
+        # Add noise to the latents (diffusion forward process)
+        noisy_latents = self.training_noise_scheduler.add_noise(
+            gt_depth_latent, noise, timesteps
+        )  # [B, 4, h, w]
+
+        # Text embedding
+        text_embed = self.empty_text_embed.to(device).repeat(
+            (batch_size, 1, 1)
+        )  # [B, 77, 1024]
+
+        # Concat rgb and depth latents
+        da2_condition_latent = (
+            da2_depth_latent
+            if self.da2_conditioning_enabled
+            else torch.zeros_like(da2_depth_latent)
+        )
+        cat_latents = torch.cat(
+            [rgb_latent, noisy_latents] if self.model.unet.config["in_channels"] == 8
+            else [rgb_latent, da2_condition_latent, noisy_latents], dim=1
+        )
+        cat_latents = cat_latents.float()
+
+        # Predict the noise residual
+        amp_context = torch.autocast("cuda", dtype=torch.float16) if self.use_fp16 else nullcontext()
+        with amp_context:
+            if hasattr(self.model, "predict_noise"):
+                model_pred = self.model.predict_noise(cat_latents, timesteps, text_embed)
+            else:
+                model_pred = self.model.unet(cat_latents, timesteps, text_embed).sample
+        model_pred = model_pred.float()
+
+        if torch.isnan(model_pred).any():
+            logging.warning("model_pred contains NaN.")
+
+        # Get the target for loss depending on the prediction type
+        if "sample" == self.prediction_type:
+            target = gt_depth_latent
+        elif "epsilon" == self.prediction_type:
+            target = noise
+        elif "v_prediction" == self.prediction_type:
+            target = self.training_noise_scheduler.get_velocity(
+                gt_depth_latent, noise, timesteps
+            )  # [B, 4, h, w]
+        else:
+            raise ValueError(f"Unknown prediction type {self.prediction_type}")
+
+        alphas_cumprod = self.training_noise_scheduler.alphas_cumprod.to(device)
+        alpha_prod_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+        beta_prod_t = 1 - alpha_prod_t
+
+        if "v_prediction" == self.prediction_type:
+            pred_x0 = (alpha_prod_t ** 0.5) * noisy_latents - (beta_prod_t ** 0.5) * model_pred
+        elif "epsilon" == self.prediction_type:
+            pred_x0 = (noisy_latents - (beta_prod_t ** 0.5) * model_pred) / (alpha_prod_t ** 0.5)
+        else:
+            pred_x0 = model_pred # sample type
+
+
+        if self.min_snr_enabled:
+            snr_weight = min_snr_weight(
+                alpha_prod_t,
+                self.prediction_type,
+                self.min_snr_gamma,
+                self.min_snr_floor,
+            )
+        else:
+            snr_weight = torch.ones_like(alpha_prod_t)
+
+        diff = model_pred.float() - target.float()
+        if "l1" in self.cfg.loss.name.lower():
+            unreduced_loss = torch.abs(diff)
+        else:
+            unreduced_loss = torch.square(diff)
+
+        unreduced_loss = unreduced_loss * snr_weight
+
+        if self.gt_mask_type is not None:
+            latent_loss = torch.where(valid_mask_down, unreduced_loss, 0.0).sum() / valid_mask_down.sum().clamp_min(1)
+            grad_loss = self.latent_grad_loss(
+                pred_x0.float(),
+                gt_depth_latent.float(),
+                valid_mask_down
+            )
+        else:
+            latent_loss = unreduced_loss
+            grad_loss = self.latent_grad_loss(pred_x0.float(), gt_depth_latent.float())
+
+        loss = (
+            latent_loss.mean()
+            + self.latent_gradient_weight * grad_loss.mean()
+        )
+        vgc_loss = loss.new_zeros(())
+
+        if self.vgc_enabled:
+            # VGC only supervises invalid-depth regions. This prevents the
+            # regularizer from directly supervising valid pixels. Shared
+            # U-Net parameters still require indoor regression evaluation.
+            vgc_loss = self._validity_guided_completion_loss(
+                pred_x0=pred_x0.float(),
+                prior_latent=da2_depth_latent.float().detach(),
+                invalid_mask=invalid_mask_down,
+                far_mask=da2_far_mask_down,
+            )
+            loss = loss + vgc_loss
+
+        self.train_metrics.update("loss", loss.item())
+        if self.cfg.trainer.get("check_finite_loss", False) and not torch.isfinite(loss):
+            raise FloatingPointError("Non-finite training loss; stop before corrupting the optimizer")
+        self.train_metrics.update("diffusion_loss", latent_loss.mean().item())
+        self.train_metrics.update("latent_gradient_loss", grad_loss.mean().item())
+        self.train_metrics.update("completion_loss", vgc_loss.item())
+
+        loss = loss / self.gradient_accumulation_steps
+        self.scaler.scale(loss).backward()
+
+    def _step_accumulated_gradients(self, pending_batches):
+        # GradScaler skips optimizer.step on overflow. Retry the SAME effective
+        # batch at its reduced scale so effective_iter, LR and dataset-mixture
+        # schedules still count successful updates, including with prefetch.
+        for retry in range(17):
+            previous_scale = self.scaler.get_scale()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
+            if self.scaler.get_scale() >= previous_scale:
+                self.lr_scheduler.step()
+                return
+            if retry == 16:
+                raise FloatingPointError("FP16 gradients still overflow after 16 retries")
+            logging.warning("FP16 gradient overflow; retrying the same effective batch at scale %s",
+                            self.scaler.get_scale())
+            self.train_metrics.reset()
+            for batch, local_seed in pending_batches:
+                self._backward_batch(batch, local_seed)
+
+    def _report_memory(self):
+        device = torch.device(self.device)
+        # mem_get_info in PyTorch 2.4 rejects an unindexed torch.device('cuda').
+        # Resolve against the current CUDA device rather than assuming GPU 0.
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        torch.cuda.synchronize(device_index)
+        free, total = torch.cuda.mem_get_info(device_index)
+        gib = 1024 ** 3
+        record = {
+            "effective_iter": self.effective_iter,
+            "gpu": torch.cuda.get_device_name(device_index),
+            "allocated_gib": torch.cuda.memory_allocated(device_index) / gib,
+            "peak_allocated_gib": torch.cuda.max_memory_allocated(device_index) / gib,
+            "peak_reserved_gib": torch.cuda.max_memory_reserved(device_index) / gib,
+            "device_free_gib": free / gib, "device_total_gib": total / gib,
+            "backbone": self.cfg.model.get("backbone", "sd2"),
+            "optimizer": self.cfg.optimizer.name,
+            "unet_parameters": sum(p.numel() for p in self.model.unet.parameters()),
+            "mixed_precision": self.cfg.trainer.get("mixed_precision", "no"),
+            "gradient_checkpointing": self.cfg.trainer.get("gradient_checkpointing", False),
+            "microbatch": self.cfg.dataloader.max_train_batch_size,
+            "accumulation_steps": self.accumulation_steps,
+        }
+        logging.info("CUDA memory: %s", json.dumps(record))
+        path = os.path.join(self.out_dir_ckpt, "..", "memory_profile.json")
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(record, stream, indent=2)
 
     def _validity_guided_completion_loss(
         self, pred_x0, prior_latent, invalid_mask, far_mask=None
@@ -917,6 +1006,8 @@ class MarigoldTrainer:
         # Store inference-relevant ablation switches beside every checkpoint,
         # including final checkpoints that do not contain trainer.ckpt.
         settings = {
+            "backbone": self.cfg.model.get("backbone", "sd2"),
+            "unet_in_channels": self.model.unet.config["in_channels"],
             "da2_conditioning_enabled": self.da2_conditioning_enabled,
             "da2_config": OmegaConf.to_container(self.cfg.da2, resolve=True)
             if self.cfg.get("da2") is not None else None,
@@ -928,6 +1019,7 @@ class MarigoldTrainer:
         if save_train_state:
             state = {
                 "optimizer": self.optimizer.state_dict(),
+                "grad_scaler": self.scaler.state_dict(),
                 "lr_scheduler": self.lr_scheduler.state_dict(),
                 "config": self.cfg,
                 "effective_iter": self.effective_iter,
@@ -957,14 +1049,14 @@ class MarigoldTrainer:
         # Load UNet
         _model_path = os.path.join(ckpt_path, "unet", "diffusion_pytorch_model.bin")
         self.model.unet.load_state_dict(
-            torch.load(_model_path, map_location=self.device)
+            torch.load(_model_path, map_location="cpu", weights_only=True)
         )
         self.model.unet.to(self.device)
         logging.info(f"UNet parameters are loaded from {_model_path}")
 
         # Load training states
         if load_trainer_state:
-            checkpoint = torch.load(os.path.join(ckpt_path, "trainer.ckpt"))
+            checkpoint = torch.load(os.path.join(ckpt_path, "trainer.ckpt"), map_location="cpu", weights_only=False)
             self.effective_iter = checkpoint["effective_iter"]
             self.epoch = checkpoint["epoch"]
             self.n_batch_in_epoch = checkpoint["n_batch_in_epoch"]
@@ -975,6 +1067,8 @@ class MarigoldTrainer:
 
             self.optimizer.load_state_dict(checkpoint["optimizer"])
             logging.info(f"optimizer state is loaded from {ckpt_path}")
+            if self.use_fp16 and checkpoint.get("grad_scaler"):
+                self.scaler.load_state_dict(checkpoint["grad_scaler"])
 
             if resume_lr_scheduler:
                 self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])

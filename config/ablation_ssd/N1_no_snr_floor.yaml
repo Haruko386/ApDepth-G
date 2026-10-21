@@ -1,0 +1,6 @@
+base_config:
+- config/train_ssd.yaml
+
+# Table IV N1: remove only the positive Min-SNR floor; preserve all endpoint settings.
+diffusion_schedule:
+  min_snr_floor: 0.0

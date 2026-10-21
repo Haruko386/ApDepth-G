@@ -150,16 +150,20 @@ class MarigoldPipeline(DiffusionPipeline):
         self.da2_conditioning_enabled = da2_conditioning_enabled
 
         da2_config = resolve_da2_config(da2_config)
+        self.register_to_config(da2_config=da2_config)
+        self.da2 = self._load_depth_prior()
+
+    def _load_depth_prior(self):
+        da2_config = self.config.da2_config
         checkpoint_path = da2_checkpoint_path(da2_config)
         if not checkpoint_path.is_file():
             raise FileNotFoundError(f"DA2 checkpoint not found: {checkpoint_path}. "
                                     "Configure encoder/checkpoint in config/da2.yaml.")
-        self.register_to_config(da2_config=da2_config)
-        self.da2 = DepthAnythingV2(**{
+        prior = DepthAnythingV2(**{
             key: da2_config[key] for key in ("encoder", "features", "out_channels")
         })
-        self.da2.load_state_dict(torch.load(checkpoint_path, map_location="cpu", weights_only=True))
-        self.da2.requires_grad_(False).eval()
+        prior.load_state_dict(torch.load(checkpoint_path, map_location="cpu", weights_only=True))
+        return prior.requires_grad_(False).eval()
 
     def to(self, *args, **kwargs):
         pipeline = super().to(*args, **kwargs)
@@ -460,13 +464,14 @@ class MarigoldPipeline(DiffusionPipeline):
 
         for i, t in iterable:
             unet_input = torch.cat(
-                [rgb_latent, da2_depth_latent, depth_latent], dim=1
+                [rgb_latent, depth_latent] if self.unet.config.in_channels == 8
+                else [rgb_latent, da2_depth_latent, depth_latent], dim=1
             )  # this order is important
 
             # predict the noise residual
-            noise_pred = self.unet(
-                unet_input, t, encoder_hidden_states=batch_empty_text_embed
-            ).sample  # [B, 4, h, w]
+            noise_pred = self.predict_noise(
+                unet_input, t, batch_empty_text_embed
+            )  # [B, 4, h, w]
 
             # compute the previous noisy sample x_t -> x_t-1
             depth_latent = self.scheduler.step(
@@ -481,6 +486,9 @@ class MarigoldPipeline(DiffusionPipeline):
         depth = (depth + 1.0) / 2.0
 
         return depth
+
+    def predict_noise(self, latents, timesteps, text_embed):
+        return self.unet(latents, timesteps, encoder_hidden_states=text_embed).sample
 
     def encode_rgb(self, rgb_in: torch.Tensor) -> torch.Tensor:
         """

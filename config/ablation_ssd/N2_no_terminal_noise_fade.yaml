@@ -1,0 +1,7 @@
+base_config:
+- config/train_ssd.yaml
+
+# Table IV N2: remove only near-endpoint fading of structured noise.
+# Keep exact final-timestep Gaussian matching, zero-SNR and trailing DDIM.
+diffusion_schedule:
+  terminal_noise_fade_enabled: false

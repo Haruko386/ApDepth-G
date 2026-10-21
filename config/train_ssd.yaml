@@ -1,0 +1,29 @@
+base_config:
+- config/train_marigold.yaml
+
+# Inherit main's complete objective, sampling schedule and 8000-update budget.
+model:
+  backbone: ssd
+  pretrained_path: SSD-1B
+  latent_scale_factor: 0.13025 # actual value comes from the SSD VAE config
+
+pipeline:
+  name: SDXLDepthPipeline
+
+dataloader:
+  effective_batch_size: 42
+  max_train_batch_size: 1
+  num_workers: 4
+
+trainer:
+  use_xformers: false
+  gradient_checkpointing: true
+  mixed_precision: "no" # enable AMP explicitly with train.py --fp16
+  report_cuda_memory: true
+  check_finite_loss: true
+
+optimizer:
+  name: Adam8bit
+
+# Full SSD U-Net tuning; conservative XL-family learning rate as on nightly.
+lr: 1.0e-5
