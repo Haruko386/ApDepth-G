@@ -47,6 +47,16 @@ trainer:
   validation_period: 0
   visualization_period: 0
 
+# Optional RGB folder previews; enabled by train.py --test-files DIR.
+# Period counts optimizer updates after gradient accumulation, not microbatches.
+test_inference:
+  input_dir: null
+  period: 2000 # 0 disables previews
+  denoising_steps: 50
+  processing_res: 768
+  color_map: Spectral
+  seed: 2024
+
 multi_res_noise:
   strength: 0.9
   annealed: true
@@ -80,7 +90,7 @@ da2_conditioning_enabled: true
 # v-prediction keeps x0 reconstruction finite at exactly zero terminal SNR;
 # the small floor prevents Min-SNR from discarding that endpoint entirely.
 diffusion_schedule:
-  prediction_type: v_prediction
+  prediction_type: epsilon
   rescale_betas_zero_snr: true
   timestep_spacing: trailing
   min_snr_floor: 0.05

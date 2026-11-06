@@ -179,6 +179,46 @@ A full FP32 SDXL U-Net is about 9.56 GiB; reserve ample checkpoint disk space.
 
 ## Inference on your images
 
+### Periodic previews while training
+
+Pass an RGB folder to `train.py --test-files` to save depth color PNGs using
+the current training weights, without loading another model or requiring GT:
+
+```bash
+python train.py \
+  --config config/train_sdxl_demo.yaml \
+  --base_data_dir "${BASE_DATA_DIR}" --base_ckpt_dir "${BASE_CKPT_DIR}" \
+  --output_dir output/sdxl_main_v2 --no_wandb \
+  --test-files input/in-the-wild_example
+```
+
+Configure the interval in YAML (SDXL inherits these settings from
+`config/train_marigold.yaml`):
+
+```yaml
+test_inference:
+  input_dir: null       # --test-files overrides this; no folder means disabled
+  period: 2000         # completed optimizer updates, after gradient accumulation
+  denoising_steps: 50
+  processing_res: 768
+  color_map: Spectral
+  seed: 2024
+```
+
+Each interval processes all supported images recursively, one at a time, with
+ensemble size 1. PNGs go to
+`<run>/visualization/test_files/iter_002000/<original-filename>.depth.png`;
+subdirectories and the original file extension are retained to avoid name clashes.
+Each image uses the same seed across intervals for visual comparison. The model
+returns to training mode after inference; training random state is preserved.
+Previews add inference time and do not compute validation metrics.
+
+Set `period: 0` to disable previews. Resume uses the saved run's `config.yaml`,
+including its preview settings; `--test-files` can override its input folder
+for that invocation. For older runs, add `test_inference` to the saved config
+to customize the interval (otherwise passing `--test-files` defaults to 2000).
+No preview runs immediately on resume; the next matching update triggers it.
+
 Copy the entire iteration directory to the inference server, including `unet/`,
 `scheduler/` and `inference_settings.json`. Keep the run's `config.yaml` as well.
 Both servers need the same SDXL base and DA2 weights.

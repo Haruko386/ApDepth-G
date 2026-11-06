@@ -77,6 +77,11 @@ if "__main__" == __name__:
         "--output_dir", type=str, default=None, help="directory to save checkpoints"
     )
     parser.add_argument("--no_cuda", action="store_true", help="Do not use cuda.")
+    parser.add_argument(
+        "--test-files", type=str, default=None,
+        help="Folder of RGB images for periodic depth previews (includes subfolders). "
+             "Interval and inference options are configured in test_inference.",
+    )
     parser.add_argument("--fp16", "--half_precision", action="store_true",
                         help="Enable FP16 AMP training; default is FP32, including resume.")
     parser.add_argument(
@@ -153,6 +158,13 @@ if "__main__" == __name__:
     # Precision is an explicit invocation choice, also when resuming. Never
     # silently inherit FP16/BF16 from an older saved run configuration.
     cfg.trainer.mixed_precision = "fp16" if args.fp16 else "no"
+    if args.test_files is not None:
+        test_dir = os.path.abspath(os.path.expanduser(args.test_files))
+        if not os.path.isdir(test_dir):
+            raise ValueError(f"Test image folder does not exist: {test_dir}")
+        if cfg.get("test_inference") is None:
+            cfg.test_inference = {}
+        cfg.test_inference.input_dir = test_dir
     cfg_data = cfg.dataset
 
     # Other directories

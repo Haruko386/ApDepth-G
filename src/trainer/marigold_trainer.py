@@ -52,6 +52,7 @@ from src.util.metric import MetricTracker
 from src.util.multi_res_noise import multi_res_noise_like
 from src.util.alignment import align_depth_least_square
 from src.util.seeding import generate_seed_sequence
+from src.util.training_preview import TrainingPreview
 from src.util.diffusion_training import (
     align_inference_scheduler, align_training_scheduler,
     latent_validity_masks, min_snr_weight, terminal_noise_fade,
@@ -82,6 +83,7 @@ class MarigoldTrainer:
         self.out_dir_ckpt = out_dir_ckpt
         self.out_dir_eval = out_dir_eval
         self.out_dir_vis = out_dir_vis
+        self.training_preview = TrainingPreview(cfg.get("test_inference") or {}, out_dir_vis)
         self.train_loader: DataLoader = train_dataloader
         self.val_loaders: List[DataLoader] = val_dataloaders
         self.vis_loaders: List[DataLoader] = vis_dataloaders
@@ -812,6 +814,8 @@ class MarigoldTrainer:
         # Visualization
         if self.vis_period > 0 and 0 == self.effective_iter % self.vis_period:
             self.visualize()
+
+        self.training_preview.maybe_run(self.model, self.effective_iter, self.device)
 
     def validate(self):
         for i, val_loader in enumerate(self.val_loaders):
