@@ -10,16 +10,11 @@ from src.util.data_loader import skip_first_batches
 
 
 class MixedSamplerTest(unittest.TestCase):
-    def make_sampler(self, lengths=(18, 14), accumulation=2, total_steps=8, schedule=None):
+    def make_sampler(self, lengths=(18, 14), prob=(.9, .1)):
         datasets = [TensorDataset(torch.full((n,), i)) for i, n in enumerate(lengths)]
         sampler = MixedBatchSampler(
             datasets, batch_size=2, drop_last=True, shuffle=True,
-            prob=[0.9, 0.1], generator=torch.Generator().manual_seed(17),
-            probability_schedule=schedule if schedule is not None else {
-                "enabled": True, "start_fraction": .2, "end_fraction": .8,
-                "final_prob_ls": [.8, .2],
-            },
-            total_steps=total_steps, accumulation_steps=accumulation,
+            prob=prob, generator=torch.Generator().manual_seed(17),
         )
         return sampler, ConcatDataset(datasets)
 
@@ -36,58 +31,54 @@ class MixedSamplerTest(unittest.TestCase):
             batches = [batch[0].tolist() for batch in skip_first_batches(loader, skip)]
         return probabilities, batches
 
-    def test_default_config_boundaries_and_fixed_ablation(self):
+    def test_default_config_is_fixed_nine_to_one(self):
         cfg = recursive_load_config("config/train_marigold.yaml")
-        sampler, _ = self.make_sampler(total_steps=cfg.max_iter,
-                                      schedule=cfg.dataset.train.probability_schedule)
-        for step, expected in [(0, .1), (4600, .1), (11500, .15),
-                               (18400, .2), (23000, .2), (30000, .2)]:
-            self.assertAlmostEqual(sampler.probabilities_at(step)[1].item(), expected)
-        fixed, _ = self.make_sampler(schedule={"enabled": False})
-        self.assertAlmostEqual(fixed.probabilities_at(23000)[1].item(), .1)
-        # A legacy config without a schedule preserves fixed sampling.
-        legacy = MixedBatchSampler([range(10), range(10)], 2, True, False, prob=[.9, .1])
-        self.assertFalse(legacy.schedule_enabled)
+        self.assertEqual(list(cfg.dataset.train.prob_ls), [.9, .1])
+        self.assertNotIn("probability_schedule", cfg.dataset.train)
+        sampler, dataset = self.make_sampler(prob=cfg.dataset.train.prob_ls)
+        for _ in range(3):
+            probabilities, _ = self.collect(sampler, dataset)
+            for probability in probabilities:
+                torch.testing.assert_close(probability, torch.tensor([.9, .1], dtype=probability.dtype))
 
-    def test_prefetch_does_not_advance_schedule(self):
+    def test_prefetch_preserves_fixed_sampling(self):
         baseline, dataset = self.make_sampler()
         expected, expected_batches = self.collect(baseline, dataset)
         prefetched, dataset = self.make_sampler()
         actual, batches = self.collect(prefetched, dataset, workers=2)
         torch.testing.assert_close(torch.stack(actual), torch.stack(expected))
         self.assertEqual(batches, expected_batches)
-        for i, probability in enumerate(actual):
-            torch.testing.assert_close(probability, prefetched.probabilities_at(i // 2))
+        for probability in actual:
+            torch.testing.assert_close(probability, prefetched.prob)
 
-    def test_resume_replays_skipped_positions_without_resetting_progress(self):
+    def test_resume_replays_skipped_batches_with_fixed_probabilities(self):
         full, dataset = self.make_sampler()
         expected, expected_batches = self.collect(full, dataset)
         resumed, dataset = self.make_sampler()
-        resumed.set_epoch_start(completed_steps=3, skipped_batches=6)
         actual, batches = self.collect(resumed, dataset, workers=2, skip=6)
         torch.testing.assert_close(torch.stack(actual[6:]), torch.stack(expected[6:]))
         self.assertEqual(batches, expected_batches[6:])
 
-    def test_accumulation_crosses_epoch_boundary(self):
-        sampler, dataset = self.make_sampler(lengths=(8, 6), accumulation=3)
+    def test_sampling_stays_fixed_across_epoch_boundaries(self):
+        sampler, dataset = self.make_sampler(lengths=(8, 6))
         first, _ = self.collect(sampler, dataset)
-        sampler.set_epoch_start(completed_steps=2, accumulated_batches=1)
         second, _ = self.collect(sampler, dataset)
-        for i, probability in enumerate(first + second):
-            torch.testing.assert_close(probability, sampler.probabilities_at(i // 3))
-        # Resume in a later epoch, whose first batch has global position seven.
-        sampler.set_epoch_start(completed_steps=3, skipped_batches=2)
-        self.assertEqual(sampler.epoch_start_batch, 7)
+        for probability in first + second:
+            torch.testing.assert_close(probability, sampler.prob)
+
+    def test_observed_ratio_and_single_dataset_batches(self):
+        sampler, dataset = self.make_sampler(lengths=(10000, 10000))
+        outdoor = 0
+        for indices in sampler:
+            sources = [dataset[index][0].item() for index in indices]
+            self.assertEqual(len(set(sources)), 1)
+            outdoor += sources[0]
+        self.assertAlmostEqual(outdoor / len(sampler), .1, delta=.02)
 
     def test_invalid_configs_fail_early(self):
-        for final in ([1], [-1, 2], [0, 0], [float("nan"), 1]):
-            with self.subTest(final=final), self.assertRaises(ValueError):
-                self.make_sampler(schedule={"enabled": True, "final_prob_ls": final})
-        with self.assertRaises(ValueError):
-            self.make_sampler(total_steps=0)
-        with self.assertRaises(ValueError):
-            self.make_sampler(schedule={"enabled": True, "final_prob_ls": [.8, .2],
-                                        "start_fraction": .8, "end_fraction": .2})
+        for probabilities in ([1], [-1, 2], [0, 0], [float("nan"), 1]):
+            with self.subTest(probabilities=probabilities), self.assertRaises(ValueError):
+                self.make_sampler(prob=probabilities)
 
 
 if __name__ == "__main__":

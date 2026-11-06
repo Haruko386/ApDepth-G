@@ -17,7 +17,7 @@ Run every command below from the repository root.
 
 | Component | SDXL behavior |
 |---|---|
-| Progressive dataset sampling | Hypersim/VKITTI 90/10 to 80/20, indexed by optimizer updates, with resume support |
+| Fixed dataset sampling | Hypersim/VKITTI 90/10 throughout training and resume |
 | Standalone DA2 | `config/da2.yaml`: vits/vitb/vitl/vitg and checkpoint path; frozen FP32 |
 | Corrected DA2 depth | ImageNet input normalization; near = -1, far = +1 |
 | VGC | Region mean anchor, interior smoothness, corrected DA2 far-region anchor |
@@ -140,7 +140,7 @@ python train.py \
 FP16 training uses autocast and GradScaler; U-Net master weights, losses, the
 SDXL VAE and frozen DA2 remain FP32. A gradient overflow lowers the scale and
 replays the same accumulated batch with the same diffusion seeds, so iteration,
-LR and dataset sampling progress advance only after a successful update.
+LR and the optimizer update counter advance only after a successful update.
 Only CPU input batches are retained for a retry, not their GPU activations.
 
 The config filename is retained for compatibility. This is full U-Net training:
@@ -148,13 +148,13 @@ The config filename is retained for compatibility. This is full U-Net training:
 learning rate 1e-5. The scheduler is configuration state, not an optimized model.
 Training validation loaders are disabled; evaluate separately as shown below.
 
-Sampling follows `config/dataset/dataset_train.yaml`: 90% Hypersim / 10% VKITTI
-through 4,600 completed updates, linearly changes to 80% / 20% by update 18,400,
-then stays fixed. At 11,500 completed updates, the next update uses 85% / 15%.
-Each microbatch samples one dataset. These are probabilities, not fixed quotas.
-Set `probability_schedule.enabled: false` for fixed sampling.
+Sampling follows `config/dataset/dataset_train.yaml`: fixed 90% Hypersim / 10%
+VKITTI throughout training. Each microbatch samples one dataset. These are
+probabilities, not exact quotas within each ten batches. Dynamic sampling has
+been removed; an old saved `probability_schedule` has no effect on resume.
+Resume uses the saved `prob_ls`, which should remain `[0.9, 0.1]`.
 TensorBoard logs target `train_sampling/probability/*` and observed
-`train_sampling/observed_ratio/*`. Worker prefetching does not advance the schedule.
+`train_sampling/observed_ratio/*`.
 
 Resume **only a run started with this updated configuration**:
 

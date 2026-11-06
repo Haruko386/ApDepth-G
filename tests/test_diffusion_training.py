@@ -244,6 +244,9 @@ class DiffusionTrainingTest(unittest.TestCase):
 
         torch.manual_seed(7)
         cfg = recursive_load_config("config/train_marigold.yaml")
+        # This integration fixture exercises the v-prediction trainer, independent
+        # of the prediction-type experiment selected in the working YAML.
+        cfg.diffusion_schedule.prediction_type = "v_prediction"
         cfg.max_iter = 1
         cfg.max_epoch = 1
         cfg.lr_scheduler.kwargs.warmup_steps = 0
@@ -276,8 +279,6 @@ class DiffusionTrainingTest(unittest.TestCase):
                     datasets.append(samples)
                 sampler = MixedBatchSampler(
                     datasets, 1, True, False, prob=[.9, .1],
-                    probability_schedule=cfg.dataset.train.probability_schedule,
-                    total_steps=cfg.max_iter, accumulation_steps=2,
                 )
                 loader = torch.utils.data.DataLoader(
                     torch.utils.data.ConcatDataset(datasets), batch_sampler=sampler,
@@ -331,7 +332,7 @@ class DiffusionTrainingTest(unittest.TestCase):
             (captured_far_masks[0] & ~captured_invalid_masks[0]).any()
         )
 
-    def test_real_trainer_with_dynamic_mixed_sampler(self):
+    def test_real_trainer_with_fixed_mixed_sampler(self):
         self._run_trainer(mixed=True)
 
 

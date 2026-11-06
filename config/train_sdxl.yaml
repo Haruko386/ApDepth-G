@@ -10,7 +10,7 @@ pipeline:
   name: SDXLDepthPipeline
 
 # Inherit the current main objective: region anchor, interior smoothness,
-# corrected DA2 far anchor, terminal-SNR alignment and progressive sampling.
+# corrected DA2 far anchor, terminal-SNR alignment and fixed 9:1 sampling.
 # Only backbone, memory settings and learning rate differ from SD2.
 
 dataloader:

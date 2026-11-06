@@ -2,7 +2,7 @@
 
 These eleven configurations mirror `config/ablation/`, but inherit
 `config/train_sdxl_demo.yaml`. The full model shares all main training objectives,
-progressive dataset sampling and DA2 configuration. SDXL-specific optimizer,
+fixed 9:1 dataset sampling and DA2 configuration. SDXL-specific optimizer,
 precision, microbatch, learning rate and backbone settings remain unchanged
 across the ablations.
 

@@ -14,7 +14,7 @@ Starting nightly: fetched `origin/nightly` at `9aeb19e`.
 | `463b8b5`: terminal diffusion alignment | Shared schedule utilities/trainer; checkpoint DDIM saved and restored |
 | `7e09644`: corrected DA2 far-field anchor | Shared corrected DA2 preprocessing and depth convention; VGC far-cell selection and loss |
 | `73f4d78`: ablation matrix | Original SD2 configs plus 11 SDXL configurations with identical component switches |
-| `45ef3fc`: progressive sampling and standalone DA2 | Shared sampler, prefetch-safe update position, resume and TensorBoard logging; SDXL constructor forwards DA2 arguments |
+| `45ef3fc`: sampling and standalone DA2 | Sampling now stays fixed at Hypersim/VKITTI 9:1; SDXL constructor forwards DA2 arguments |
 | `9b29f4b`: complete ablations/inference settings | Region/smoothness ablations, checkpoint metadata, scheduler and DA2 restoration; SDXL-aware evaluation runners |
 | `4c9d3dd`: resolution notation | Shared dataset configs; no change to image preprocessing |
 
@@ -57,8 +57,8 @@ a synthetic frozen DA2 prior instead of external weights. They cover conditionin
 latent scaling, DA2 configuration, gradient checkpointing, optimizer updates,
 checkpoint restore, matching v-prediction/DDIM and multi-step seeded inference.
 Shared tests cover conservative validity masks, far-region loss, noise alignment,
-dynamic sampling across accumulation/epoch boundaries and schedule position after
-resume. Dataset CLI tests check command forwarding and evaluation on synthetic GT.
+fixed sampling across epoch boundaries and skipped batches on resume.
+Dataset CLI tests check command forwarding and evaluation on synthetic GT.
 
 Full SDXL/DA2 weights and datasets are not present locally. FP16 CUDA, Adam8bit
 CUDA kernels, full-resolution peak memory, runtime and accuracy still require

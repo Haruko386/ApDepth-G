@@ -316,10 +316,6 @@ class MarigoldTrainer:
             logging.debug(f"epoch: {self.epoch}")
 
             # Skip previous batches when resume
-            if mixed_sampler is not None:
-                mixed_sampler.set_epoch_start(
-                    self.effective_iter, accumulated_step, self.n_batch_in_epoch
-                )
             for batch in skip_first_batches(self.train_loader, self.n_batch_in_epoch):
                 self.model.unet.train()
                 if mixed_sampler is not None:
@@ -348,7 +344,7 @@ class MarigoldTrainer:
                         self._report_memory()
 
                     if mixed_sampler is not None:
-                        probabilities = mixed_sampler.probabilities_at(self.effective_iter - 1)
+                        probabilities = mixed_sampler.prob
                         sample_count = sum(mixture_counts.values())
                         mixture_metrics = {}
                         for ds, probability in zip(mixed_sampler.src_dataset_ls, probabilities):

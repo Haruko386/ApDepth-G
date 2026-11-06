@@ -2,8 +2,8 @@
 
 All 11 configurations inherit `config/train_marigold.yaml`. Train each one
 independently from the same SD2 base model for 23,000 optimizer updates, with an
-effective batch size of 42 and seeds of 2024. All runs share progressive dataset
-sampling (VKITTI 10% to 20%). There is no sampling-strategy ablation.
+effective batch size of 42 and seeds of 2024. All runs share fixed dataset
+sampling (90% Hypersim / 10% VKITTI). There is no sampling-strategy ablation.
 
 ## Configuration matrix
 
@@ -50,8 +50,7 @@ done
 ```
 
 The output layout is `output/ablation/<config_stem>/`. Do not start one ablation
-from another ablation's weights. Do not resume an old fixed-mixture run and label
-it as the new progressive-mixture reference. Existing output directories are not
+from another ablation's weights. Existing output directories are not
 overwritten. To resume an interrupted matching run, use its
 `checkpoint/latest` with `--resume_run`, then continue the remaining configs.
 

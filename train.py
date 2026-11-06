@@ -311,9 +311,6 @@ if "__main__" == __name__:
             prob=cfg_data.train.prob_ls,
             shuffle=True,
             generator=loader_generator,
-            probability_schedule=cfg_data.train.get("probability_schedule"),
-            total_steps=cfg.max_iter,
-            accumulation_steps=accumulation_steps,
         )
         train_loader = DataLoader(
             concat_dataset,
